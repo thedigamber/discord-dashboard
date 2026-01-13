@@ -1,633 +1,426 @@
 import discord
 from discord.ext import commands
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, redirect, url_for, session, request, jsonify
 import os
+import time
 import asyncio
 import json
-import time
+import threading
 from datetime import datetime
 
-# ========== CONFIG ==========
-TOKEN = os.environ.get('BOT_TOKEN')
+# ========== CONFIGURATION ==========
+DISCORD_CLIENT_ID = os.environ.get('DISCORD_CLIENT_ID')
+DISCORD_CLIENT_SECRET = os.environ.get('DISCORD_CLIENT_SECRET')
+DISCORD_BOT_TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
+DISCORD_REDIRECT_URI = os.environ.get('DISCORD_REDIRECT_URI', 'https://dashboard.digamber.in/callback')
+FLASK_SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', 'your-secret-key-here')
 
 # ========== FLASK APP ==========
 app = Flask(__name__)
+app.secret_key = FLASK_SECRET_KEY
 
-# HTML Template
+# ========== DISCORD BOT ==========
+intents = discord.Intents.default()
+intents.guilds = True
+intents.messages = True
+intents.message_content = True
+intents.emojis = True
+
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+
+# Storage
+user_sessions = {}
+message_history = []
+
+# HTML TEMPLATE
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>🤖 Discord Message Dashboard</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-            font-family: 'Segoe UI', Arial, sans-serif;
-        }
-        
         body {
             background: linear-gradient(135deg, #1a1a2e, #16213e);
             color: white;
-            min-height: 100vh;
+            font-family: Arial, sans-serif;
+            margin: 0;
             padding: 20px;
         }
-        
         .container {
             max-width: 1200px;
             margin: 0 auto;
         }
-        
         .header {
             text-align: center;
             padding: 40px 0;
-            background: rgba(255, 255, 255, 0.05);
+            background: rgba(255,255,255,0.05);
             border-radius: 20px;
             margin-bottom: 30px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
         }
-        
-        .title {
-            font-size: 3rem;
+        h1 {
+            font-size: 3em;
             background: linear-gradient(90deg, #00dbde, #fc00ff);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             margin-bottom: 10px;
         }
-        
-        .subtitle {
-            color: #aaa;
-            font-size: 1.2rem;
+        .login-btn {
+            background: #7289da;
+            color: white;
+            padding: 15px 30px;
+            border: none;
+            border-radius: 5px;
+            font-size: 1.2em;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            margin-top: 20px;
         }
-        
+        .login-btn:hover {
+            background: #5b6eae;
+        }
         .dashboard {
             display: grid;
             grid-template-columns: 300px 1fr;
-            gap: 30px;
-            margin-top: 30px;
+            gap: 20px;
         }
-        
         .sidebar {
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 15px;
+            background: rgba(255,255,255,0.05);
             padding: 20px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
         }
-        
-        .main-content {
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 15px;
-            padding: 30px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
+        .main {
+            background: rgba(255,255,255,0.05);
+            padding: 20px;
+            border-radius: 10px;
         }
-        
-        .guild-list {
-            max-height: 500px;
-            overflow-y: auto;
-        }
-        
         .guild-item {
-            display: flex;
-            align-items: center;
-            padding: 15px;
-            background: rgba(255, 255, 255, 0.08);
-            border-radius: 10px;
-            margin-bottom: 10px;
-            cursor: pointer;
-            transition: all 0.3s;
-        }
-        
-        .guild-item:hover {
-            background: rgba(255, 255, 255, 0.12);
-            transform: translateX(5px);
-        }
-        
-        .guild-item.active {
-            background: linear-gradient(90deg, #00dbde, #0093E9);
-        }
-        
-        .guild-icon {
-            width: 50px;
-            height: 50px;
-            border-radius: 50%;
-            margin-right: 15px;
-            background: #333;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 20px;
-        }
-        
-        .guild-name {
-            font-size: 1.1rem;
-            font-weight: 500;
-        }
-        
-        .form-group {
-            margin-bottom: 25px;
-        }
-        
-        label {
-            display: block;
-            margin-bottom: 8px;
-            color: #00ff88;
-            font-weight: 500;
-        }
-        
-        select, textarea, input {
-            width: 100%;
-            padding: 15px;
-            background: rgba(255, 255, 255, 0.08);
-            border: 2px solid rgba(255, 255, 255, 0.1);
-            border-radius: 10px;
-            color: white;
-            font-size: 1rem;
-            transition: border 0.3s;
-        }
-        
-        select:focus, textarea:focus, input:focus {
-            outline: none;
-            border-color: #00ff88;
-        }
-        
-        textarea {
-            min-height: 150px;
-            resize: vertical;
-            font-family: monospace;
-        }
-        
-        .preview-box {
-            background: rgba(0, 0, 0, 0.3);
-            border-radius: 10px;
-            padding: 20px;
-            margin: 20px 0;
-            border-left: 4px solid #00ff88;
-            white-space: pre-wrap;
-            font-family: monospace;
-        }
-        
-        .button-group {
-            display: flex;
-            gap: 15px;
-            margin-top: 30px;
-        }
-        
-        .btn {
-            padding: 15px 30px;
-            border: none;
-            border-radius: 10px;
-            font-size: 1.1rem;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        
-        .btn-primary {
-            background: linear-gradient(90deg, #00dbde, #0093E9);
-            color: white;
-        }
-        
-        .btn-primary:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 10px 20px rgba(0, 219, 222, 0.3);
-        }
-        
-        .btn-secondary {
-            background: rgba(255, 255, 255, 0.1);
-            color: white;
-        }
-        
-        .btn-secondary:hover {
-            background: rgba(255, 255, 255, 0.2);
-        }
-        
-        .emoji-picker {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(40px, 1fr));
-            gap: 10px;
-            margin-top: 10px;
-            max-height: 200px;
-            overflow-y: auto;
             padding: 10px;
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 10px;
-        }
-        
-        .emoji-item {
-            font-size: 24px;
-            text-align: center;
-            padding: 5px;
-            cursor: pointer;
+            margin: 5px 0;
+            background: rgba(255,255,255,0.1);
             border-radius: 5px;
-            transition: background 0.3s;
+            cursor: pointer;
         }
-        
-        .emoji-item:hover {
-            background: rgba(255, 255, 255, 0.1);
+        .guild-item:hover {
+            background: rgba(255,255,255,0.2);
         }
-        
+        .channel-item {
+            padding: 8px;
+            margin: 3px 0;
+            background: rgba(255,255,255,0.05);
+            border-radius: 3px;
+            cursor: pointer;
+        }
+        .channel-item:hover {
+            background: rgba(255,255,255,0.1);
+        }
+        textarea, input, select {
+            width: 100%;
+            padding: 10px;
+            margin: 10px 0;
+            background: rgba(255,255,255,0.1);
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 5px;
+            color: white;
+        }
+        button {
+            background: #00ff88;
+            color: black;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: bold;
+            margin: 5px;
+        }
+        button:hover {
+            background: #00cc66;
+        }
+        .emoji-picker {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+            margin: 10px 0;
+        }
+        .emoji {
+            font-size: 24px;
+            cursor: pointer;
+            padding: 5px;
+        }
+        .emoji:hover {
+            background: rgba(255,255,255,0.2);
+            border-radius: 5px;
+        }
+        .preview {
+            background: rgba(0,0,0,0.3);
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+            white-space: pre-wrap;
+        }
         .message-log {
             max-height: 300px;
             overflow-y: auto;
-            margin-top: 30px;
-            padding: 20px;
-            background: rgba(0, 0, 0, 0.3);
-            border-radius: 10px;
+            margin-top: 20px;
         }
-        
         .log-item {
-            padding: 15px;
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 10px;
-            margin-bottom: 10px;
+            padding: 10px;
+            margin: 5px 0;
+            background: rgba(255,255,255,0.05);
+            border-radius: 5px;
             border-left: 3px solid #00ff88;
         }
-        
-        .log-time {
-            color: #00ff88;
-            font-size: 0.8rem;
-            margin-bottom: 5px;
-        }
-        
-        .log-content {
-            font-size: 0.9rem;
-            line-height: 1.4;
-        }
-        
-        .status-bar {
-            display: flex;
-            justify-content: space-between;
-            background: rgba(255, 255, 255, 0.05);
-            padding: 15px;
-            border-radius: 10px;
-            margin-bottom: 20px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }
-        
-        .status-item {
-            text-align: center;
-        }
-        
-        .status-value {
-            font-size: 1.5rem;
-            font-weight: bold;
-            color: #00ff88;
-        }
-        
-        .status-label {
-            color: #aaa;
-            font-size: 0.9rem;
-        }
     </style>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 </head>
 <body>
+    {% if not user %}
     <div class="container">
         <div class="header">
-            <h1 class="title">🤖 Discord Message Dashboard</h1>
-            <p class="subtitle">Send messages to any server where bot is present</p>
+            <h1>🤖 Discord Message Dashboard</h1>
+            <p>Send messages to any server where bot is present</p>
+            <a href="/login" class="login-btn">Login with Discord</a>
         </div>
-        
-        <div class="status-bar">
-            <div class="status-item">
-                <div class="status-value" id="serverCount">0</div>
-                <div class="status-label">Servers</div>
-            </div>
-            <div class="status-item">
-                <div class="status-value" id="channelCount">0</div>
-                <div class="status-label">Channels</div>
-            </div>
-            <div class="status-item">
-                <div class="status-value" id="emojiCount">0</div>
-                <div class="status-label">Emojis</div>
-            </div>
-            <div class="status-item">
-                <div class="status-value"><i class="fas fa-circle" style="color:#00ff88"></i></div>
-                <div class="status-label">Status</div>
-            </div>
+    </div>
+    {% else %}
+    <div class="container">
+        <div class="header">
+            <h1>Welcome, {{ user.username }}!</h1>
+            <p>Select a server and channel to send messages</p>
+            <a href="/logout" style="color:#ff6666; text-decoration:none;">Logout</a>
         </div>
         
         <div class="dashboard">
-            <!-- Sidebar: Server List -->
             <div class="sidebar">
-                <h3><i class="fas fa-server"></i> Select Server</h3>
-                <div class="guild-list" id="guildList">
-                    <!-- Guilds will be loaded here -->
-                    <div class="guild-item">
-                        <div class="guild-icon">🤖</div>
-                        <div class="guild-name">Loading servers...</div>
+                <h3>Your Servers</h3>
+                <div id="guilds">
+                    {% for guild in guilds %}
+                    <div class="guild-item" onclick="selectGuild('{{ guild.id }}', '{{ guild.name|replace("'", "\\'") }}')">
+                        {{ guild.name }}
                     </div>
+                    {% endfor %}
                 </div>
             </div>
             
-            <!-- Main Content: Message Form -->
-            <div class="main-content">
-                <h3><i class="fas fa-edit"></i> Compose Message</h3>
+            <div class="main">
+                <div id="selectedGuild" style="margin-bottom:20px; color:#00ff88;"></div>
                 
-                <div class="form-group">
-                    <label><i class="fas fa-hashtag"></i> Select Channel</label>
-                    <select id="channelSelect">
-                        <option value="">Select a server first</option>
-                    </select>
+                <div id="channelSection" style="display:none;">
+                    <h3>Select Channel</h3>
+                    <div id="channels"></div>
                 </div>
                 
-                <div class="form-group">
-                    <label><i class="fas fa-heading"></i> Message Title</label>
-                    <input type="text" id="messageTitle" placeholder="Enter message title (optional)">
-                </div>
-                
-                <div class="form-group">
-                    <label><i class="fas fa-comment"></i> Message Content</label>
-                    <textarea id="messageContent" placeholder="Type your message here..."></textarea>
-                </div>
-                
-                <div class="form-group">
-                    <label><i class="fas fa-smile"></i> Emoji Picker</label>
-                    <div class="emoji-picker" id="emojiPicker">
-                        <!-- Emojis will be loaded here -->
-                        <div class="emoji-item">😀</div>
-                        <div class="emoji-item">😂</div>
-                        <div class="emoji-item">❤️</div>
-                        <div class="emoji-item">🔥</div>
+                <div id="messageSection" style="display:none;">
+                    <h3>Compose Message</h3>
+                    
+                    <input type="text" id="title" placeholder="Message Title (optional)">
+                    
+                    <textarea id="content" rows="6" placeholder="Type your message here..."></textarea>
+                    
+                    <div id="emojiSection">
+                        <h4>Emojis</h4>
+                        <div id="emojis" class="emoji-picker"></div>
+                    </div>
+                    
+                    <h4>Preview</h4>
+                    <div id="preview" class="preview"></div>
+                    
+                    <div>
+                        <button onclick="sendMessage()">📨 Send Message</button>
+                        <button onclick="sendEmbed()">🎨 Send as Embed</button>
+                        <button onclick="clearForm()">🗑️ Clear</button>
                     </div>
                 </div>
                 
-                <div class="form-group">
-                    <label><i class="fas fa-eye"></i> Preview</label>
-                    <div class="preview-box" id="messagePreview">
-                        Preview will appear here...
-                    </div>
-                </div>
-                
-                <div class="button-group">
-                    <button class="btn btn-primary" onclick="sendMessage()">
-                        <i class="fas fa-paper-plane"></i> Send Message
-                    </button>
-                    <button class="btn btn-secondary" onclick="previewMessage()">
-                        <i class="fas fa-eye"></i> Update Preview
-                    </button>
-                    <button class="btn btn-secondary" onclick="clearForm()">
-                        <i class="fas fa-trash"></i> Clear
-                    </button>
-                </div>
-                
-                <!-- Message Log -->
                 <div class="message-log">
-                    <h4><i class="fas fa-history"></i> Recent Messages</h4>
-                    <div id="messageLog">
-                        <div class="log-item">
-                            <div class="log-time">No messages sent yet</div>
-                            <div class="log-content">Send your first message to see it here!</div>
-                        </div>
-                    </div>
+                    <h3>Recent Messages</h3>
+                    <div id="logs"></div>
                 </div>
             </div>
         </div>
     </div>
     
     <script>
-        let selectedGuild = null;
-        let selectedChannel = null;
-        let emojis = [];
+        let selectedGuildId = null;
+        let selectedChannelId = null;
         
-        // Load guilds on page load
-        document.addEventListener('DOMContentLoaded', function() {
-            loadGuilds();
-            updateEmojiPicker();
-            updatePreview();
-        });
-        
-        // Load guilds from API
-        async function loadGuilds() {
-            try {
-                const response = await fetch('/api/guilds');
-                const data = await response.json();
-                
-                const guildList = document.getElementById('guildList');
-                guildList.innerHTML = '';
-                
-                data.guilds.forEach(guild => {
-                    const guildItem = document.createElement('div');
-                    guildItem.className = 'guild-item';
-                    guildItem.innerHTML = `
-                        <div class="guild-icon">${guild.icon ? `<img src="${guild.icon}" alt="${guild.name}">` : '🤖'}</div>
-                        <div class="guild-name">${guild.name}</div>
-                    `;
+        function selectGuild(guildId, guildName) {
+            selectedGuildId = guildId;
+            document.getElementById('selectedGuild').innerHTML = `📁 Selected: <strong>${guildName}</strong>`;
+            
+            // Load channels
+            fetch(`/api/channels?guild_id=${guildId}`)
+                .then(r => r.json())
+                .then(data => {
+                    const channelsDiv = document.getElementById('channels');
+                    channelsDiv.innerHTML = '';
                     
-                    guildItem.onclick = () => selectGuild(guild);
-                    guildList.appendChild(guildItem);
+                    data.channels.forEach(channel => {
+                        const div = document.createElement('div');
+                        div.className = 'channel-item';
+                        div.innerHTML = `#${channel.name}`;
+                        div.onclick = () => selectChannel(channel.id, channel.name);
+                        channelsDiv.appendChild(div);
+                    });
+                    
+                    document.getElementById('channelSection').style.display = 'block';
                 });
-                
-                // Update stats
-                document.getElementById('serverCount').textContent = data.guilds.length;
-                document.getElementById('channelCount').textContent = data.total_channels || 0;
-                document.getElementById('emojiCount').textContent = data.total_emojis || 0;
-                
-            } catch (error) {
-                console.error('Error loading guilds:', error);
-            }
-        }
-        
-        // Select guild
-        function selectGuild(guild) {
-            selectedGuild = guild;
             
-            // Update UI
-            document.querySelectorAll('.guild-item').forEach(item => {
-                item.classList.remove('active');
-            });
-            event.currentTarget.classList.add('active');
-            
-            // Load channels for this guild
-            loadChannels(guild.id);
-            loadEmojis(guild.id);
-        }
-        
-        // Load channels
-        async function loadChannels(guildId) {
-            try {
-                const response = await fetch(`/api/channels?guild_id=${guildId}`);
-                const data = await response.json();
-                
-                const channelSelect = document.getElementById('channelSelect');
-                channelSelect.innerHTML = '<option value="">Select a channel</option>';
-                
-                data.channels.forEach(channel => {
-                    const option = document.createElement('option');
-                    option.value = channel.id;
-                    option.textContent = `#${channel.name}`;
-                    channelSelect.appendChild(option);
+            // Load emojis
+            fetch(`/api/emojis?guild_id=${guildId}`)
+                .then(r => r.json())
+                .then(data => {
+                    const emojisDiv = document.getElementById('emojis');
+                    emojisDiv.innerHTML = '';
+                    
+                    data.emojis.forEach(emoji => {
+                        const span = document.createElement('span');
+                        span.className = 'emoji';
+                        span.innerHTML = emoji;
+                        span.onclick = () => insertEmoji(emoji);
+                        emojisDiv.appendChild(span);
+                    });
                 });
-                
-                channelSelect.onchange = function() {
-                    selectedChannel = this.value;
-                };
-                
-            } catch (error) {
-                console.error('Error loading channels:', error);
-            }
         }
         
-        // Load emojis
-        async function loadEmojis(guildId) {
-            try {
-                const response = await fetch(`/api/emojis?guild_id=${guildId}`);
-                const data = await response.json();
-                
-                emojis = data.emojis || [];
-                updateEmojiPicker();
-                
-            } catch (error) {
-                console.error('Error loading emojis:', error);
-            }
-        }
-        
-        // Update emoji picker
-        function updateEmojiPicker() {
-            const emojiPicker = document.getElementById('emojiPicker');
-            emojiPicker.innerHTML = '';
-            
-            // Default emojis
-            const defaultEmojis = ['😀', '😂', '❤️', '🔥', '👍', '🎉', '✨', '🌟', '🚀', '💯'];
-            
-            defaultEmojis.forEach(emoji => {
-                const emojiItem = document.createElement('div');
-                emojiItem.className = 'emoji-item';
-                emojiItem.textContent = emoji;
-                emojiItem.onclick = () => insertEmoji(emoji);
-                emojiPicker.appendChild(emojiItem);
-            });
-            
-            // Custom emojis
-            emojis.forEach(emoji => {
-                const emojiItem = document.createElement('div');
-                emojiItem.className = 'emoji-item';
-                emojiItem.innerHTML = emoji;
-                emojiItem.onclick = () => insertEmoji(emoji);
-                emojiPicker.appendChild(emojiItem);
-            });
-        }
-        
-        // Insert emoji into message
-        function insertEmoji(emoji) {
-            const textarea = document.getElementById('messageContent');
-            const cursorPos = textarea.selectionStart;
-            const text = textarea.value;
-            
-            textarea.value = text.substring(0, cursorPos) + emoji + text.substring(cursorPos);
-            textarea.focus();
-            textarea.selectionStart = textarea.selectionEnd = cursorPos + emoji.length;
-            
+        function selectChannel(channelId, channelName) {
+            selectedChannelId = channelId;
+            document.getElementById('selectedGuild').innerHTML += ` | 📢 Channel: <strong>${channelName}</strong>`;
+            document.getElementById('messageSection').style.display = 'block';
             updatePreview();
         }
         
-        // Update preview
-        function updatePreview() {
-            const title = document.getElementById('messageTitle').value;
-            const content = document.getElementById('messageContent').value;
-            const preview = document.getElementById('messagePreview');
-            
-            let previewHTML = '';
-            
-            if (title) {
-                previewHTML += `<strong>${title}</strong>\\n\\n`;
-            }
-            
-            previewHTML += content || 'No content entered yet';
-            
-            preview.textContent = previewHTML;
+        function insertEmoji(emoji) {
+            const textarea = document.getElementById('content');
+            const start = textarea.selectionStart;
+            const end = textarea.selectionEnd;
+            textarea.value = textarea.value.substring(0, start) + emoji + textarea.value.substring(end);
+            textarea.focus();
+            textarea.selectionStart = textarea.selectionEnd = start + emoji.length;
+            updatePreview();
         }
         
-        // Send message
-        async function sendMessage() {
-            if (!selectedGuild || !selectedChannel) {
+        function updatePreview() {
+            const title = document.getElementById('title').value;
+            const content = document.getElementById('content').value;
+            const preview = document.getElementById('preview');
+            
+            let html = '';
+            if (title) {
+                html += `<strong style="color:#00ff88">${title}</strong><br><br>`;
+            }
+            html += content || 'No content entered';
+            preview.innerHTML = html;
+        }
+        
+        function sendMessage() {
+            if (!selectedGuildId || !selectedChannelId) {
                 alert('Please select a server and channel first!');
                 return;
             }
             
-            const title = document.getElementById('messageTitle').value;
-            const content = document.getElementById('messageContent').value;
+            const title = document.getElementById('title').value;
+            const content = document.getElementById('content').value;
             
             if (!content.trim()) {
                 alert('Please enter a message!');
                 return;
             }
             
-            try {
-                const response = await fetch('/api/send', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                        guild_id: selectedGuild.id,
-                        channel_id: selectedChannel,
-                        title: title,
-                        content: content
-                    })
-                });
-                
-                const result = await response.json();
-                
-                if (result.success) {
-                    alert('✅ Message sent successfully!');
-                    addToMessageLog(title, content, selectedGuild.name);
+            fetch('/api/send', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    guild_id: selectedGuildId,
+                    channel_id: selectedChannelId,
+                    title: title,
+                    content: content,
+                    embed: false
+                })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    alert('✅ Message sent!');
+                    addToLog(title, content, '📨');
                     clearForm();
                 } else {
-                    alert('❌ Error: ' + (result.error || 'Failed to send message'));
+                    alert('❌ Error: ' + data.error);
                 }
-                
-            } catch (error) {
-                alert('❌ Network error: ' + error.message);
-            }
+            });
         }
         
-        // Add to message log
-        function addToMessageLog(title, content, guildName) {
-            const log = document.getElementById('messageLog');
-            const now = new Date().toLocaleTimeString();
+        function sendEmbed() {
+            if (!selectedGuildId || !selectedChannelId) {
+                alert('Please select a server and channel first!');
+                return;
+            }
             
+            const title = document.getElementById('title').value;
+            const content = document.getElementById('content').value;
+            
+            if (!content.trim()) {
+                alert('Please enter a message!');
+                return;
+            }
+            
+            fetch('/api/send', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    guild_id: selectedGuildId,
+                    channel_id: selectedChannelId,
+                    title: title,
+                    content: content,
+                    embed: true
+                })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    alert('✅ Embed sent!');
+                    addToLog(title, content, '🎨');
+                    clearForm();
+                } else {
+                    alert('❌ Error: ' + data.error);
+                }
+            });
+        }
+        
+        function addToLog(title, content, type) {
+            const logs = document.getElementById('logs');
+            const time = new Date().toLocaleTimeString();
             const logItem = document.createElement('div');
             logItem.className = 'log-item';
-            logItem.innerHTML = `
-                <div class="log-time">${now} • ${guildName}</div>
-                <div class="log-content">
-                    ${title ? `<strong>${title}</strong><br>` : ''}
-                    ${content.substring(0, 100)}${content.length > 100 ? '...' : ''}
-                </div>
-            `;
-            
-            log.insertBefore(logItem, log.firstChild);
-            
-            // Keep only last 10 logs
-            const items = log.getElementsByClassName('log-item');
-            if (items.length > 10) {
-                log.removeChild(items[items.length - 1]);
-            }
+            logItem.innerHTML = `<small>${time} ${type}</small><br>${title ? `<strong>${title}</strong><br>` : ''}${content.substring(0, 50)}...`;
+            logs.insertBefore(logItem, logs.firstChild);
         }
         
-        // Preview message
-        function previewMessage() {
-            updatePreview();
-        }
-        
-        // Clear form
         function clearForm() {
-            document.getElementById('messageTitle').value = '';
-            document.getElementById('messageContent').value = '';
+            document.getElementById('title').value = '';
+            document.getElementById('content').value = '';
             updatePreview();
         }
         
         // Auto-update preview
-        document.getElementById('messageTitle').addEventListener('input', updatePreview);
-        document.getElementById('messageContent').addEventListener('input', updatePreview);
+        document.getElementById('title').addEventListener('input', updatePreview);
+        document.getElementById('content').addEventListener('input', updatePreview);
+        
+        // Load message logs
+        fetch('/api/logs')
+            .then(r => r.json())
+            .then(data => {
+                const logs = document.getElementById('logs');
+                data.messages.forEach(msg => {
+                    const logItem = document.createElement('div');
+                    logItem.className = 'log-item';
+                    logItem.innerHTML = `<small>${new Date(msg.timestamp * 1000).toLocaleTimeString()} ${msg.type}</small><br>${msg.title ? `<strong>${msg.title}</strong><br>` : ''}${msg.content}`;
+                    logs.appendChild(logItem);
+                });
+            });
     </script>
+    {% endif %}
 </body>
 </html>
 '''
@@ -635,40 +428,97 @@ HTML_TEMPLATE = '''
 # ========== FLASK ROUTES ==========
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/api/guilds')
-def api_guilds():
-    """Get all guilds where bot is present"""
-    guilds = []
-    total_channels = 0
-    total_emojis = 0
+    user = session.get('user')
+    if not user:
+        return render_template_string(HTML_TEMPLATE, user=None)
     
+    # Get user's guilds where bot is also present
+    user_guilds = []
     for guild in bot.guilds:
-        guild_info = {
-            'id': str(guild.id),
-            'name': guild.name,
-            'icon': str(guild.icon.url) if guild.icon else None,
-            'member_count': guild.member_count,
-            'channel_count': len(guild.channels),
-            'emoji_count': len(guild.emojis)
-        }
-        guilds.append(guild_info)
-        
-        total_channels += len(guild.channels)
-        total_emojis += len(guild.emojis)
+        if str(guild.id) in session.get('user_guilds', []):
+            user_guilds.append({
+                'id': str(guild.id),
+                'name': guild.name,
+                'icon': str(guild.icon.url) if guild.icon else None
+            })
     
-    return jsonify({
-        'guilds': guilds,
-        'total_channels': total_channels,
-        'total_emojis': total_emojis
-    })
+    return render_template_string(HTML_TEMPLATE, user=user, guilds=user_guilds)
+
+@app.route('/login')
+def login():
+    # Discord OAuth2 URL
+    params = {
+        'client_id': DISCORD_CLIENT_ID,
+        'redirect_uri': DISCORD_REDIRECT_URI,
+        'response_type': 'code',
+        'scope': 'identify guilds'
+    }
+    url = f"https://discord.com/api/oauth2/authorize?{'&'.join([f'{k}={v}' for k, v in params.items()])}"
+    return redirect(url)
+
+@app.route('/callback')
+def callback():
+    code = request.args.get('code')
+    if not code:
+        return "No code provided", 400
+    
+    # Exchange code for token
+    data = {
+        'client_id': DISCORD_CLIENT_ID,
+        'client_secret': DISCORD_CLIENT_SECRET,
+        'grant_type': 'authorization_code',
+        'code': code,
+        'redirect_uri': DISCORD_REDIRECT_URI,
+        'scope': 'identify guilds'
+    }
+    
+    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+    
+    import requests
+    r = requests.post('https://discord.com/api/oauth2/token', data=data, headers=headers)
+    if r.status_code != 200:
+        return f"Token exchange failed: {r.text}", 400
+    
+    token_data = r.json()
+    access_token = token_data['access_token']
+    
+    # Get user info
+    headers = {'Authorization': f'Bearer {access_token}'}
+    r = requests.get('https://discord.com/api/users/@me', headers=headers)
+    if r.status_code != 200:
+        return "Failed to get user info", 400
+    
+    user = r.json()
+    
+    # Get user guilds
+    r = requests.get('https://discord.com/api/users/@me/guilds', headers=headers)
+    user_guilds = r.json() if r.status_code == 200 else []
+    
+    # Store in session
+    session['user'] = user
+    session['access_token'] = access_token
+    session['user_guilds'] = [str(g['id']) for g in user_guilds]
+    
+    # Store in bot data
+    user_sessions[str(user['id'])] = {
+        'user': user,
+        'access_token': access_token,
+        'guilds': [str(g['id']) for g in user_guilds]
+    }
+    
+    return redirect('/')
+
+@app.route('/logout')
+def logout():
+    user_id = session.get('user', {}).get('id')
+    if user_id:
+        user_sessions.pop(str(user_id), None)
+    session.clear()
+    return redirect('/')
 
 @app.route('/api/channels')
 def api_channels():
-    """Get channels for a specific guild"""
     guild_id = request.args.get('guild_id')
-    
     if not guild_id:
         return jsonify({'channels': []})
     
@@ -676,7 +526,6 @@ def api_channels():
     if not guild:
         return jsonify({'channels': []})
     
-    # Get only text channels where bot can send messages
     channels = []
     for channel in guild.channels:
         if isinstance(channel, discord.TextChannel) and channel.permissions_for(guild.me).send_messages:
@@ -690,9 +539,7 @@ def api_channels():
 
 @app.route('/api/emojis')
 def api_emojis():
-    """Get emojis for a specific guild"""
     guild_id = request.args.get('guild_id')
-    
     if not guild_id:
         return jsonify({'emojis': []})
     
@@ -700,21 +547,18 @@ def api_emojis():
     if not guild:
         return jsonify({'emojis': []})
     
-    emojis = []
-    for emoji in guild.emojis:
-        emojis.append(str(emoji))
-    
+    emojis = [str(emoji) for emoji in guild.emojis]
     return jsonify({'emojis': emojis})
 
 @app.route('/api/send', methods=['POST'])
 def api_send():
-    """Send message to channel"""
     try:
         data = request.json
         guild_id = int(data['guild_id'])
         channel_id = int(data['channel_id'])
         title = data.get('title', '')
         content = data.get('content', '')
+        embed = data.get('embed', False)
         
         guild = bot.get_guild(guild_id)
         if not guild:
@@ -724,88 +568,68 @@ def api_send():
         if not channel:
             return jsonify({'success': False, 'error': 'Channel not found'})
         
-        # Check permissions
         if not channel.permissions_for(guild.me).send_messages:
             return jsonify({'success': False, 'error': 'No permission to send messages'})
         
-        # Create embed if title is provided
-        if title:
-            embed = discord.Embed(
+        # Send message
+        if embed:
+            embed_obj = discord.Embed(
                 title=title,
                 description=content,
                 color=discord.Color.blue(),
                 timestamp=discord.utils.utcnow()
             )
-            asyncio.run_coroutine_threadsafe(channel.send(embed=embed), bot.loop)
+            asyncio.run_coroutine_threadsafe(channel.send(embed=embed_obj), bot.loop)
         else:
-            asyncio.run_coroutine_threadsafe(channel.send(content), bot.loop)
+            if title:
+                final_content = f"**{title}**\n\n{content}"
+            else:
+                final_content = content
+            asyncio.run_coroutine_threadsafe(channel.send(final_content), bot.loop)
         
-        # Log the message
-        log_message = {
+        # Log
+        message_history.append({
             'timestamp': time.time(),
             'guild': guild.name,
             'channel': channel.name,
             'title': title,
-            'content': content[:100] + '...' if len(content) > 100 else content
-        }
-        bot_data['message_history'].append(log_message)
+            'content': content[:50] + '...' if len(content) > 50 else content,
+            'type': '🎨' if embed else '📨'
+        })
         
-        # Keep only last 100 messages
-        if len(bot_data['message_history']) > 100:
-            bot_data['message_history'] = bot_data['message_history'][-100:]
+        if len(message_history) > 50:
+            message_history.pop(0)
         
         return jsonify({'success': True})
         
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
-@app.route('/api/messages')
-def api_messages():
-    """Get recent messages"""
-    return jsonify({'messages': bot_data['message_history'][-10:]})
+@app.route('/api/logs')
+def api_logs():
+    return jsonify({'messages': message_history[-10:]})
 
 @app.route('/health')
 def health():
     return jsonify({'status': 'healthy', 'bot': 'online'})
 
-# ========== DISCORD BOT EVENTS ==========
+# ========== BOT EVENTS ==========
 @bot.event
 async def on_ready():
     print(f"✅ Bot logged in as {bot.user}")
     print(f"📊 Serving {len(bot.guilds)} servers")
-    print(f"🌐 Dashboard available at: http://localhost:5000")
-    
-    await bot.change_presence(
-        activity=discord.Activity(
-            type=discord.ActivityType.watching,
-            name="Message Dashboard"
-        )
-    )
-    
-    # Update bot data
-    for guild in bot.guilds:
-        bot_data['connected_guilds'].append({
-            'id': str(guild.id),
-            'name': guild.name
-        })
-        
-        # Store emojis
-        emoji_list = [str(emoji) for emoji in guild.emojis]
-        bot_data['available_emojis'][str(guild.id)] = emoji_list
 
-# ========== RUN APPLICATION ==========
+# ========== RUN ==========
 def run_flask():
-    app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
+    app.run(host='0.0.0.0', port=8080, debug=False)
 
 def main():
     print("🚀 Starting Discord Message Dashboard...")
     
-    # Start Flask in background thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
-    # Run Discord bot
-    bot.run(TOKEN)
+    bot.run(DISCORD_BOT_TOKEN)
 
 if __name__ == "__main__":
     main()
