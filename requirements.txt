@@ -1,0 +1,3 @@
+discord.py==2.2.3
+audioloop-lts==1.0.0
+flask==2.3.3
