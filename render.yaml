@@ -2,9 +2,21 @@ services:
   - type: web
     name: discord-message-dashboard
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      pip install --upgrade pip
+      pip install discord.py==2.3.2 flask==2.3.3
     startCommand: python main.py
     envVars:
-      - key: BOT_TOKEN
+      - key: DISCORD_CLIENT_ID
         sync: false
+      - key: DISCORD_CLIENT_SECRET
+        sync: false
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_REDIRECT_URI
+        value: https://dashboard.digamber.in/callback
+        sync: false
+      - key: FLASK_SECRET_KEY
+        generateValue: true
     plan: free
+    healthCheckPath: /health
