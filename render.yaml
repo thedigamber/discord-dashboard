@@ -4,7 +4,7 @@ services:
     env: python
     buildCommand: |
       pip install --upgrade pip
-      pip install discord.py==2.3.2 flask==2.3.3
+      pip install discord.py==2.3.2 flask==2.3.3 audioloop-lts==1.0.0
     startCommand: python main.py
     envVars:
       - key: DISCORD_CLIENT_ID
