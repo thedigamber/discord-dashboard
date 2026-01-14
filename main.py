@@ -43,7 +43,7 @@ from datetime import datetime
 DISCORD_CLIENT_ID = os.environ.get('DISCORD_CLIENT_ID')
 DISCORD_CLIENT_SECRET = os.environ.get('DISCORD_CLIENT_SECRET')
 DISCORD_BOT_TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
-DISCORD_REDIRECT_URI = os.environ.get('DISCORD_REDIRECT_URI', 'https://dashboard.digamber.in/callback')
+DISCORD_REDIRECT_URI = os.environ.get('DISCORD_REDIRECT_URI', 'https://dashboard.digamber.in/api/auth/callback/discord')
 FLASK_SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', 'your-secret-key-here')
 
 # ========== FLASK APP ==========
@@ -953,7 +953,7 @@ HTML_TEMPLATE = '''
                 </a>
             </div>
             <p style="color: var(--light); margin-top: 20px;">
-                🤖 Discord Message Dashboard v2.0 | Powered by Discord.py & Flask
+                🤖 Discord Message Dashboard v2.0 | Powered by Digamber Fuckner 👺
             </p>
             <p class="update-time" style="color: var(--light); font-size: 0.9rem; margin-top: 10px;">
                 Last Updated: <span id="currentTime">{{ current_time }}</span>
