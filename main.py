@@ -3,23 +3,16 @@ import sys
 import json
 import sqlite3
 import requests
-import base64
-import hashlib
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
-from io import BytesIO
-from PIL import Image
-import aiofiles
+from flask import Flask, request, redirect, session, render_template_string, jsonify, send_from_directory, url_for
+from urllib.parse import urlencode
 import asyncio
 import discord
 from discord.ext import commands, tasks
-from flask import Flask, request, redirect, session, render_template_string, jsonify, send_from_directory, url_for
-from urllib.parse import urlencode
-import urllib.parse
 
-# Configuration
+# --- CONFIG (NO CHANGES NEEDED) ---
 CONFIG = {
     'client_id': os.environ.get('DISCORD_CLIENT_ID'),
     'client_secret': os.environ.get('DISCORD_CLIENT_SECRET'),
@@ -30,35 +23,34 @@ CONFIG = {
     'app_host': '0.0.0.0'
 }
 
-# Validate configuration
 required_vars = ['client_id', 'client_secret', 'bot_token', 'secret_key']
 missing = [var for var in required_vars if not CONFIG[var]]
 if missing:
-    print(f"ERROR: Missing required environment variables: {', '.join(missing)}")
+    print(f"❌ ERROR: Missing environment variables: {', '.join(missing)}")
     sys.exit(1)
 
-# Flask app
+# --- FLASK APP SETUP ---
 app = Flask(__name__)
 app.secret_key = CONFIG['secret_key']
-# CRITICAL: Session configuration for production
 app.config['SESSION_COOKIE_SECURE'] = True
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=30)
 
-# Discord bot
+# --- DISCORD BOT ---
 intents = discord.Intents.default()
 intents.message_content = False
 intents.guilds = True
-bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+intents.members = True  # REQUIRED for welcome messages
 
-# Database
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+bot_ready = False  # Global flag
+
+# --- DATABASE ---
 DB_NAME = 'dashboard.db'
 UPLOAD_DIR = 'uploads'
-
-# Ensure upload directory exists
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Database initialization
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
@@ -100,35 +92,27 @@ def init_db():
     ''')
     
     c.execute('''
-        CREATE TABLE IF NOT EXISTS files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            filename TEXT,
-            file_path TEXT,
-            uploaded_at INTEGER
-        )
-    ''')
-    
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS analytics (
-            date TEXT PRIMARY KEY,
-            messages_sent INTEGER DEFAULT 0,
-            files_sent INTEGER DEFAULT 0
+        CREATE TABLE IF NOT EXISTS welcome_config (
+            guild_id TEXT PRIMARY KEY,
+            channel_id TEXT,
+            message TEXT,
+            embed_data TEXT,
+            enabled INTEGER DEFAULT 0
         )
     ''')
     
     conn.commit()
     conn.close()
+    print("✅ Database initialized")
 
 init_db()
 
-# Database helpers
 def get_db():
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     return conn
 
-def update_analytics(message_increment=0, file_increment=0):
+def update_analytics(messages=0, files=0):
     today = datetime.now().strftime('%Y-%m-%d')
     conn = get_db()
     c = conn.cursor()
@@ -138,7 +122,7 @@ def update_analytics(message_increment=0, file_increment=0):
         ON CONFLICT(date) DO UPDATE SET
             messages_sent = messages_sent + excluded.messages_sent,
             files_sent = files_sent + excluded.files_sent
-    ''', (today, message_increment, file_increment))
+    ''', (today, messages, files))
     conn.commit()
     conn.close()
 
@@ -151,13 +135,13 @@ def get_analytics():
     c = conn.cursor()
     
     c.execute('SELECT SUM(messages_sent) as total FROM analytics WHERE date = ?', (today,))
-    today_messages = c.fetchone()['total'] or 0
+    today_msgs = c.fetchone()['total'] or 0
     
     c.execute('SELECT SUM(messages_sent) as total FROM analytics WHERE date >= ?', (week_ago,))
-    week_messages = c.fetchone()['total'] or 0
+    week_msgs = c.fetchone()['total'] or 0
     
     c.execute('SELECT SUM(messages_sent) as total FROM analytics WHERE date >= ?', (month_ago,))
-    month_messages = c.fetchone()['total'] or 0
+    month_msgs = c.fetchone()['total'] or 0
     
     c.execute('SELECT SUM(files_sent) as total FROM analytics WHERE date = ?', (today,))
     today_files = c.fetchone()['total'] or 0
@@ -165,16 +149,14 @@ def get_analytics():
     conn.close()
     
     return {
-        'today': today_messages,
-        'week': week_messages,
-        'month': month_messages,
+        'today': today_msgs,
+        'week': week_msgs,
+        'month': month_msgs,
         'files_today': today_files
     }
 
-# Discord OAuth helpers
-API_BASE_URL = 'https://discord.com/api/v10'
-AUTHORIZATION_BASE_URL = f'{API_BASE_URL}/oauth2/authorize'
-TOKEN_URL = f'{API_BASE_URL}/oauth2/token'
+# --- DISCORD OAUTH ---
+API_BASE = 'https://discord.com/api/v10'
 
 def generate_oauth_url():
     params = {
@@ -183,7 +165,7 @@ def generate_oauth_url():
         'response_type': 'code',
         'scope': 'identify guilds'
     }
-    return f'{AUTHORIZATION_BASE_URL}?{urlencode(params)}'
+    return f"{API_BASE}/oauth2/authorize?{urlencode(params)}"
 
 def exchange_code(code):
     data = {
@@ -194,155 +176,186 @@ def exchange_code(code):
         'redirect_uri': CONFIG['redirect_uri']
     }
     headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    response = requests.post(TOKEN_URL, data=data, headers=headers)
+    response = requests.post(f"{API_BASE}/oauth2/token", data=data, headers=headers)
     return response.json()
 
-def get_user_data(access_token):
-    headers = {'Authorization': f'Bearer {access_token}'}
-    response = requests.get(f'{API_BASE_URL}/users/@me', headers=headers)
-    return response.json()
+def get_user_data(token):
+    headers = {'Authorization': f'Bearer {token}'}
+    return requests.get(f"{API_BASE}/users/@me", headers=headers).json()
 
-def get_user_guilds(access_token):
-    headers = {'Authorization': f'Bearer {access_token}'}
-    response = requests.get(f'{API_BASE_URL}/users/@me/guilds', headers=headers)
-    return response.json()
+def get_user_guilds(token):
+    headers = {'Authorization': f'Bearer {token}'}
+    return requests.get(f"{API_BASE}/users/@me/guilds", headers=headers).json()
 
-# Discord bot helpers
-async def get_mutual_guilds(user_id):
-    user = await bot.fetch_user(user_id)
-    mutual_guilds = []
+# --- BOT HELPERS (FIXED) ---
+async def get_user_mutual_guilds(user_id):
+    """Returns guilds where both bot and user are present"""
+    global bot_ready
+    
+    while not bot_ready:
+        await asyncio.sleep(1)
+    
+    user_guilds = []
     for guild in bot.guilds:
         try:
-            member = await guild.fetch_member(user_id)
+            member = guild.get_member(int(user_id))
             if member:
-                mutual_guilds.append({
+                user_guilds.append({
                     'id': str(guild.id),
                     'name': guild.name,
                     'icon': str(guild.icon.url) if guild.icon else None
                 })
         except:
             continue
-    return mutual_guilds
+    
+    return user_guilds
 
-async def get_guild_channels(guild_id, user_id):
+async def get_guild_text_channels(guild_id, user_id):
+    """Returns channels where user can send messages"""
+    global bot_ready
+    
+    while not bot_ready:
+        await asyncio.sleep(1)
+    
     guild = bot.get_guild(int(guild_id))
     if not guild:
         return []
     
     channels = []
     for channel in guild.text_channels:
-        permissions = channel.permissions_for(guild.get_member(int(user_id)))
-        if permissions.send_messages:
-            channels.append({
-                'id': str(channel.id),
-                'name': channel.name,
-                'type': 'text'
-            })
+        try:
+            member = guild.get_member(int(user_id))
+            if member and channel.permissions_for(member).send_messages:
+                channels.append({
+                    'id': str(channel.id),
+                    'name': channel.name
+                })
+        except:
+            continue
+    
     return channels
 
-async def send_message(channel_id, content, embeds_data=None, file_paths=None):
+async def send_discord_message(channel_id, content, embeds_data=None, files=None):
+    """Send message to Discord channel"""
+    global bot_ready
+    
+    while not bot_ready:
+        await asyncio.sleep(1)
+    
     channel = bot.get_channel(int(channel_id))
     if not channel:
         return False, "Channel not found"
     
     try:
         discord_files = []
-        if file_paths:
-            for file_path in file_paths:
-                if os.path.exists(file_path):
-                    discord_files.append(discord.File(file_path))
+        if files:
+            for path in files:
+                if os.path.exists(path):
+                    discord_files.append(discord.File(path))
         
         if embeds_data:
             embeds = []
-            for embed_info in embeds_data:
+            for data in embeds_data:
                 embed = discord.Embed()
-                if embed_info.get('title'):
-                    embed.title = embed_info['title']
-                if embed_info.get('description'):
-                    embed.description = embed_info['description']
-                if embed_info.get('color'):
-                    embed.color = int(embed_info['color'].replace('#', '0x'), 16)
-                if embed_info.get('author'):
-                    embed.set_author(
-                        name=embed_info['author'].get('name'),
-                        url=embed_info['author'].get('url'),
-                        icon_url=embed_info['author'].get('icon_url')
-                    )
-                if embed_info.get('fields'):
-                    for field in embed_info['fields']:
-                        embed.add_field(
-                            name=field.get('name', 'Field Name'),
-                            value=field.get('value', 'Field Value'),
-                            inline=field.get('inline', False)
-                        )
-                if embed_info.get('thumbnail'):
-                    embed.set_thumbnail(url=embed_info['thumbnail'])
-                if embed_info.get('image'):
-                    embed.set_image(url=embed_info['image'])
-                if embed_info.get('footer'):
-                    embed.set_footer(
-                        text=embed_info['footer'].get('text'),
-                        icon_url=embed_info['footer'].get('icon_url')
-                    )
-                if embed_info.get('timestamp'):
-                    embed.timestamp = datetime.now()
-                
+                if data.get('title'): embed.title = data['title']
+                if data.get('description'): embed.description = data['description']
+                if data.get('color'): 
+                    color = data['color'].lstrip('#')
+                    embed.color = int(color, 16)
+                if data.get('author'): embed.set_author(**data['author'])
+                if data.get('fields'):
+                    for f in data['fields']:
+                        embed.add_field(**f)
+                if data.get('thumbnail'): embed.set_thumbnail(url=data['thumbnail'])
+                if data.get('image'): embed.set_image(url=data['image'])
+                if data.get('footer'): embed.set_footer(**data['footer'])
+                if data.get('timestamp'): embed.timestamp = datetime.now()
                 embeds.append(embed)
             
-            await channel.send(content=content, embeds=embeds, files=discord_files if discord_files else None)
+            await channel.send(content=content, embeds=embeds, files=discord_files or None)
         else:
-            await channel.send(content=content, files=discord_files if discord_files else None)
+            await channel.send(content=content, files=discord_files or None)
         
-        update_analytics(messages_sent=1, files_sent=len(discord_files) if discord_files else 0)
-        return True, "Message sent successfully"
+        update_analytics(messages=1, files=len(discord_files))
+        return True, "Sent successfully"
+    
     except Exception as e:
         return False, str(e)
 
-# Background task for scheduled messages
-async def process_scheduled_messages():
+# --- SCHEDULED MESSAGES ---
+async def process_scheduled():
+    """Process pending scheduled messages"""
     await bot.wait_until_ready()
+    
     while not bot.is_closed():
         try:
             conn = get_db()
             c = conn.cursor()
-            current_time = int(time.time())
+            now = int(time.time())
             
-            c.execute('''
-                SELECT * FROM messages 
-                WHERE status = 'pending' AND scheduled_time <= ? 
-                ORDER BY scheduled_time ASC
-            ''', (current_time,))
+            c.execute('SELECT * FROM messages WHERE status = "pending" AND scheduled_time <= ?', (now,))
             
-            scheduled_messages = c.fetchall()
-            
-            for msg in scheduled_messages:
-                user_id = msg['user_id']
+            for msg in c.fetchall():
                 channel_ids = json.loads(msg['channel_id'])
                 content = msg['content']
-                embed_data = json.loads(msg['embed_data']) if msg['embed_data'] else None
+                embeds = json.loads(msg['embed_data']) if msg['embed_data'] else None
                 files = json.loads(msg['files']) if msg['files'] else None
                 
                 for channel_id in channel_ids:
-                    success, status = await send_message(channel_id, content, embed_data, files)
+                    success, _ = await send_discord_message(channel_id, content, embeds, files)
+                    status = 'sent' if success else 'failed'
                     
-                    c.execute('''
-                        UPDATE messages 
-                        SET status = ?, sent_time = ? 
-                        WHERE id = ?
-                    ''', ('sent' if success else 'failed', current_time, msg['id']))
-                    
+                    c.execute('UPDATE messages SET status = ?, sent_time = ? WHERE id = ?', 
+                             (status, now, msg['id']))
                     conn.commit()
             
             conn.close()
         except Exception as e:
-            print(f"Error processing scheduled messages: {e}")
+            print(f"Schedule error: {e}")
         
         await asyncio.sleep(30)
 
-# Flask routes
+# --- WELCOME MESSAGES ---
+@bot.event
+async def on_member_join(member):
+    """Automatically send welcome message when new member joins"""
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT * FROM welcome_config WHERE guild_id = ? AND enabled = 1', (str(member.guild.id),))
+        config = c.fetchone()
+        conn.close()
+        
+        if not config:
+            return
+        
+        channel = bot.get_channel(int(config['channel_id']))
+        if not channel:
+            return
+        
+        message = config['message'].replace('{user}', f'<@{member.id}>').replace('{username}', member.name).replace('{server}', member.guild.name)
+        
+        embeds = None
+        if config['embed_data']:
+            data = json.loads(config['embed_data'])
+            if data:
+                embed_data = data[0]
+                embed = discord.Embed()
+                if embed_data.get('title'): embed.title = embed_data['title'].replace('{user}', member.name).replace('{server}', member.guild.name)
+                if embed_data.get('description'): embed.description = embed_data['description'].replace('{user}', member.name).replace('{server}', member.guild.name)
+                if embed_data.get('color'): 
+                    color = embed_data['color'].lstrip('#')
+                    embed.color = int(color, 16)
+                embeds = [embed]
+        
+        await channel.send(content=message or None, embeds=embeds)
+        
+    except Exception as e:
+        print(f"Welcome error: {e}")
+
+# --- FLASK ROUTES ---
 @app.route('/')
 def dashboard():
-    # FIXED: Check session correctly
     if 'user_id' not in session:
         return redirect(url_for('login'))
     
@@ -350,28 +363,22 @@ def dashboard():
     
     conn = get_db()
     c = conn.cursor()
-    # FIXED: Use session['user_id'] correctly
     c.execute('SELECT * FROM templates WHERE user_id = ? ORDER BY id DESC', (session['user_id'],))
     templates = c.fetchall()
     
-    c.execute('''
-        SELECT * FROM messages 
-        WHERE user_id = ? 
-        ORDER BY sent_time DESC 
-        LIMIT 50
-    ''', (session['user_id'],))
-    message_history = c.fetchall()
+    c.execute('SELECT * FROM messages WHERE user_id = ? ORDER BY sent_time DESC LIMIT 50', (session['user_id'],))
+    history = c.fetchall()
     conn.close()
     
-    # FIXED: Explicitly pass all session variables for template
-    return render_template_string(HTML_TEMPLATE, 
+    return render_template_string(HTML_TEMPLATE,
         user_id=session.get('user_id'),
         username=session.get('username'),
         avatar=session.get('avatar'),
         oauth_url=generate_oauth_url(),
         analytics=analytics,
         templates=templates,
-        message_history=message_history
+        history=history,
+        sidebar_collapsed=session.get('sidebar_collapsed', False)
     )
 
 @app.route('/login')
@@ -382,31 +389,27 @@ def login():
 def callback():
     code = request.args.get('code')
     if not code:
-        return 'No authorization code provided', 400
+        return 'No code provided', 400
     
-    token_response = exchange_code(code)
-    if 'access_token' not in token_response:
-        return f'Failed to get access token: {token_response.get("error_description", "Unknown error")}', 400
+    token_data = exchange_code(code)
+    if 'access_token' not in token_data:
+        return f"Token error: {token_data.get('error_description', 'Unknown')}", 400
     
-    access_token = token_response['access_token']
-    user_data = get_user_data(access_token)
+    user_data = get_user_data(token_data['access_token'])
     
-    # FIXED: Store session data correctly
     session['user_id'] = int(user_data['id'])
     session['username'] = user_data['username']
     session['avatar'] = f"https://cdn.discordapp.com/avatars/{user_data['id']}/{user_data['avatar']}.png" if user_data.get('avatar') else None
+    session.permanent = True
+    session.modified = True
     
     conn = get_db()
     c = conn.cursor()
-    c.execute('''
-        INSERT OR REPLACE INTO users (id, username, avatar, access_token)
-        VALUES (?, ?, ?, ?)
-    ''', (session['user_id'], session['username'], session['avatar'], access_token))
+    c.execute('REPLACE INTO users VALUES (?, ?, ?, ?, ?, ?)',
+             (session['user_id'], session['username'], session['avatar'], token_data['access_token'], token_data.get('refresh_token'), int(time.time() + token_data.get('expires_in', 604800))))
     conn.commit()
     conn.close()
     
-    # FIXED: Ensure session is saved before redirect
-    session.permanent = True
     return redirect(url_for('dashboard'))
 
 @app.route('/logout')
@@ -416,15 +419,22 @@ def logout():
 
 @app.route('/health')
 def health():
-    return 'OK', 200
+    return {'status': 'ok', 'bot_ready': bot_ready}, 200
 
 @app.route('/api/guilds')
 async def api_guilds():
     if 'user_id' not in session:
         return jsonify({'error': 'Not authenticated'}), 401
     
-    guilds = await get_mutual_guilds(session['user_id'])
-    return jsonify(guilds)
+    if not bot_ready:
+        return jsonify({'error': 'Bot is initializing...'}), 503
+    
+    try:
+        guilds = await get_user_mutual_guilds(session['user_id'])
+        return jsonify(guilds)
+    except Exception as e:
+        print(f"❌ Guilds error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/channels')
 async def api_channels():
@@ -435,11 +445,60 @@ async def api_channels():
     if not guild_id:
         return jsonify({'error': 'Missing guild_id'}), 400
     
+    if not bot_ready:
+        return jsonify({'error': 'Bot is initializing...'}), 503
+    
     try:
-        channels = await get_guild_channels(guild_id, session['user_id'])
+        channels = await get_guild_text_channels(guild_id, session['user_id'])
         return jsonify(channels)
     except Exception as e:
+        print(f"❌ Channels error: {e}")
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/welcome/config', methods=['GET', 'POST'])
+async def api_welcome_config():
+    if 'user_id' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    if request.method == 'GET':
+        guild_id = request.args.get('guild_id')
+        if not guild_id:
+            return jsonify({'error': 'Missing guild_id'}), 400
+        
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('SELECT * FROM welcome_config WHERE guild_id = ?', (guild_id,))
+        config = c.fetchone()
+        conn.close()
+        
+        if config:
+            return jsonify({
+                'channel_id': config['channel_id'],
+                'message': config['message'],
+                'embeds': json.loads(config['embed_data']) if config['embed_data'] else [],
+                'enabled': bool(config['enabled'])
+            })
+        return jsonify({'message': '', 'channel_id': '', 'enabled': False, 'embeds': []})
+    
+    elif request.method == 'POST':
+        data = request.json
+        guild_id = data.get('guild_id')
+        channel_id = data.get('channel_id')
+        message = data.get('message', '')
+        embeds = data.get('embeds', [])
+        enabled = data.get('enabled', False)
+        
+        if not guild_id or not channel_id:
+            return jsonify({'error': 'Guild and channel required'}), 400
+        
+        conn = get_db()
+        c = conn.cursor()
+        c.execute('REPLACE INTO welcome_config VALUES (?, ?, ?, ?, ?)',
+                 (guild_id, channel_id, message, json.dumps(embeds), int(enabled)))
+        conn.commit()
+        conn.close()
+        
+        return jsonify({'success': True, 'message': 'Welcome config saved'})
 
 @app.route('/api/send', methods=['POST'])
 async def api_send():
@@ -449,136 +508,70 @@ async def api_send():
     data = request.json
     channel_ids = data.get('channel_ids', [])
     content = data.get('content', '').strip()
-    embeds_data = data.get('embeds', [])
-    file_paths = data.get('files', [])
+    embeds = data.get('embeds', [])
+    files = data.get('files', [])
     
     if not channel_ids:
-        return jsonify({'error': 'No channels selected'}), 400
+        return jsonify({'error': 'Select channels first'}), 400
     
-    if not content and not embeds_data and not file_paths:
-        return jsonify({'error': 'Message cannot be empty'}), 400
+    if not content and not embeds and not files:
+        return jsonify({'error': 'Message cannot be empty'}), 401
+    
+    if not bot_ready:
+        return jsonify({'error': 'Bot is initializing...'}), 503
     
     results = []
-    
     for channel_id in channel_ids:
-        success, message = await send_message(channel_id, content, embeds_data, file_paths)
-        results.append({'channel_id': channel_id, 'success': success, 'message': message})
+        success, msg = await send_discord_message(channel_id, content, embeds, files)
+        results.append({'channel_id': channel_id, 'success': success, 'message': msg})
     
     # Save to history
     conn = get_db()
     c = conn.cursor()
-    c.execute('''
-        INSERT INTO messages (user_id, guild_id, channel_id, content, embed_data, files, sent_time, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (
-        session['user_id'],
-        '',  # guild_id can be retrieved from channel if needed
-        json.dumps(channel_ids),
-        content,
-        json.dumps(embeds_data),
-        json.dumps(file_paths),
-        int(time.time()),
-        'sent'
-    ))
+    c.execute('INSERT INTO messages (user_id, channel_id, content, embed_data, files, sent_time, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
+             (session['user_id'], json.dumps(channel_ids), content, json.dumps(embeds), json.dumps(files), int(time.time()), 'sent'))
     conn.commit()
     conn.close()
     
-    return jsonify({
-        'success': all(r['success'] for r in results),
-        'results': results
-    })
+    return jsonify({'success': True, 'results': results})
 
-@app.route('/api/upload', methods=['POST'])
-async def api_upload():
+@app.route('/api/files', methods=['POST'])
+async def api_files():
     if 'user_id' not in session:
         return jsonify({'error': 'Not authenticated'}), 401
     
     if 'files' not in request.files:
-        return jsonify({'error': 'No files provided'}), 400
+        return jsonify({'error': 'No files'}), 400
     
     files = request.files.getlist('files')
-    uploaded_files = []
+    uploaded = []
     
     for file in files:
         if file.filename == '':
             continue
         
         file.seek(0, os.SEEK_END)
-        file_length = file.tell()
+        size = file.tell()
         file.seek(0)
         
-        if file_length > 25 * 1024 * 1024:
-            return jsonify({'error': f'File {file.filename} exceeds 25MB limit'}), 400
+        if size > 25 * 1024 * 1024:
+            return jsonify({'error': f'{file.filename} > 25MB'}), 400
         
         filename = f"{int(time.time())}_{session['user_id']}_{file.filename}"
-        file_path = os.path.join(UPLOAD_DIR, filename)
+        path = os.path.join(UPLOAD_DIR, filename)
         
-        # Save file
-        await file.save(file_path)
+        await file.save(path)
         
         conn = get_db()
         c = conn.cursor()
-        c.execute('''
-            INSERT INTO files (user_id, filename, file_path, uploaded_at)
-            VALUES (?, ?, ?, ?)
-        ''', (session['user_id'], file.filename, file_path, int(time.time())))
+        c.execute('INSERT INTO files (user_id, filename, file_path, uploaded_at) VALUES (?, ?, ?, ?)',
+                 (session['user_id'], file.filename, path, int(time.time())))
         conn.commit()
         conn.close()
         
-        uploaded_files.append({
-            'filename': file.filename,
-            'path': file_path
-        })
+        uploaded.append({'filename': file.filename, 'path': path})
     
-    return jsonify({'success': True, 'files': uploaded_files})
-
-@app.route('/api/schedule', methods=['POST'])
-def api_schedule():
-    if 'user_id' not in session:
-        return jsonify({'error': 'Not authenticated'}), 401
-    
-    data = request.json
-    channel_ids = data.get('channel_ids', [])
-    content = data.get('content', '').strip()
-    embeds_data = data.get('embeds', [])
-    file_paths = data.get('files', [])
-    scheduled_time = data.get('scheduled_time')
-    
-    if not channel_ids:
-        return jsonify({'error': 'No channels selected'}), 400
-    
-    if not content and not embeds_data and not file_paths:
-        return jsonify({'error': 'Message cannot be empty'}), 400
-    
-    if not scheduled_time:
-        return jsonify({'error': 'No scheduled time provided'}), 400
-    
-    try:
-        scheduled_timestamp = int(scheduled_time)
-        if scheduled_timestamp <= int(time.time()):
-            return jsonify({'error': 'Scheduled time must be in the future'}), 400
-    except:
-        return jsonify({'error': 'Invalid scheduled time format'}), 400
-    
-    conn = get_db()
-    c = conn.cursor()
-    c.execute('''
-        INSERT INTO messages (user_id, guild_id, channel_id, content, embed_data, files, scheduled_time, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (
-        session['user_id'],
-        '',
-        json.dumps(channel_ids),
-        content,
-        json.dumps(embeds_data),
-        json.dumps(file_paths),
-        scheduled_timestamp,
-        'pending'
-    ))
-    conn.commit()
-    conn.close()
-    
-    return jsonify({'success': True, 'message': 'Message scheduled successfully'})
+    return jsonify({'success': True, 'files': uploaded})
 
 @app.route('/api/templates', methods=['GET', 'POST', 'DELETE'])
 def api_templates():
@@ -590,67 +583,51 @@ def api_templates():
     
     if request.method == 'GET':
         c.execute('SELECT * FROM templates WHERE user_id = ? ORDER BY id DESC', (session['user_id'],))
-        templates = c.fetchall()
-        conn.close()
-        return jsonify([dict(t) for t in templates])
+        return jsonify([dict(row) for row in c.fetchall()])
     
     elif request.method == 'POST':
         data = request.json
         name = data.get('name')
         content = data.get('content')
-        embeds_data = data.get('embeds', [])
+        embeds = data.get('embeds', [])
         
         if not name:
-            return jsonify({'error': 'Template name is required'}), 400
+            return jsonify({'error': 'Name required'}), 400
         
-        c.execute('''
-            INSERT INTO templates (user_id, name, content, embed_data)
-            VALUES (?, ?, ?, ?)
-        ''', (session['user_id'], name, content, json.dumps(embeds_data)))
+        c.execute('INSERT INTO templates (user_id, name, content, embed_data) VALUES (?, ?, ?, ?)',
+                 (session['user_id'], name, content, json.dumps(embeds)))
         conn.commit()
-        conn.close()
-        
-        return jsonify({'success': True, 'message': 'Template saved'})
+        return jsonify({'success': True})
     
     elif request.method == 'DELETE':
         template_id = request.args.get('id')
-        if not template_id:
-            return jsonify({'error': 'Template ID is required'}), 400
-        
-        c.execute('DELETE FROM templates WHERE id = ? AND user_id = ?', 
-                 (template_id, session['user_id']))
+        c.execute('DELETE FROM templates WHERE id = ? AND user_id = ?', (template_id, session['user_id']))
         conn.commit()
-        conn.close()
-        
-        return jsonify({'success': True, 'message': 'Template deleted'})
+        return jsonify({'success': True})
+    
+    conn.close()
 
 @app.route('/api/analytics', methods=['GET'])
 def api_analytics():
     if 'user_id' not in session:
         return jsonify({'error': 'Not authenticated'}), 401
     
-    analytics = get_analytics()
-    return jsonify(analytics)
+    return jsonify(get_analytics())
 
 @app.route('/uploads/<path:filename>')
 def uploaded_file(filename):
     return send_from_directory(UPLOAD_DIR, filename)
 
-# FIXED HTML TEMPLATE
+# --- HTML TEMPLATE ---
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Discord Message Dashboard</title>
+    <title>Discord Dashboard</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background: #1e1f29;
@@ -660,7 +637,6 @@ HTML_TEMPLATE = '''
             flex-direction: column;
             overflow: hidden;
         }
-
         .header {
             background: #2a2b38;
             padding: 15px 20px;
@@ -669,823 +645,455 @@ HTML_TEMPLATE = '''
             justify-content: space-between;
             border-bottom: 2px solid #5865F2;
         }
-
-        .logo {
-            font-size: 20px;
-            font-weight: bold;
-            color: #5865F2;
-        }
-
-        .user-info {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-
-        .avatar {
-            width: 40px;
-            height: 40px;
-            border-radius: 50%;
-            background: #5865F2;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 18px;
-            font-weight: bold;
-        }
-
-        .logout-btn {
-            background: #5865F2;
-            color: white;
+        .header-left { display: flex; align-items: center; gap: 15px; }
+        .hamburger {
+            background: none;
             border: none;
-            padding: 8px 16px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-weight: bold;
-            transition: background 0.2s;
-        }
-
-        .logout-btn:hover {
-            background: #4752C4;
-        }
-
-        .container {
-            display: flex;
-            flex: 1;
-            overflow: hidden;
-        }
-
-        .sidebar {
-            width: 280px;
-            background: #2a2b38;
-            padding: 20px;
-            overflow-y: auto;
-            border-right: 1px solid #40424e;
-        }
-
-        .main-content {
-            flex: 1;
-            padding: 20px;
-            overflow-y: auto;
-        }
-
-        .card {
-            background: #2a2b38;
-            border-radius: 8px;
-            padding: 20px;
-            margin-bottom: 20px;
-            border: 1px solid #40424e;
-        }
-
-        .card h2 {
-            color: #5865F2;
-            margin-bottom: 15px;
-            font-size: 18px;
-        }
-
-        .server-list, .channel-list {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-        }
-
-        .server-item, .channel-item {
-            background: #40424e;
-            padding: 10px;
-            border-radius: 6px;
-            cursor: pointer;
-            transition: background 0.2s;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-
-        .server-item:hover, .channel-item:hover {
-            background: #5865F2;
-        }
-
-        .server-item.selected, .channel-item.selected {
-            background: #5865F2;
-        }
-
-        .form-group {
-            margin-bottom: 15px;
-        }
-
-        label {
-            display: block;
-            margin-bottom: 5px;
-            color: #b9bbbe;
-            font-size: 12px;
-            text-transform: uppercase;
-            font-weight: bold;
-        }
-
-        input, textarea, select {
-            width: 100%;
-            padding: 10px;
-            background: #40424e;
-            border: 1px solid #62646e;
-            border-radius: 6px;
             color: white;
-            font-size: 14px;
-        }
-
-        input:focus, textarea:focus, select:focus {
-            outline: none;
-            border-color: #5865F2;
-        }
-
-        .char-counter {
-            text-align: right;
-            font-size: 12px;
-            color: #b9bbbe;
-            margin-top: 5px;
-        }
-
-        .embed-builder {
-            margin-top: 20px;
-        }
-
-        .embed-preview {
-            background: #40424e;
-            padding: 15px;
-            border-radius: 6px;
-            margin-top: 15px;
-            border-left: 4px solid #5865F2;
-        }
-
-        .file-upload {
-            border: 2px dashed #62646e;
-            padding: 30px;
-            text-align: center;
-            border-radius: 6px;
-            cursor: pointer;
-            transition: border-color 0.2s;
-        }
-
-        .file-upload:hover {
-            border-color: #5865F2;
-        }
-
-        .file-list {
-            margin-top: 15px;
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-        }
-
-        .file-item {
-            background: #40424e;
-            padding: 8px 12px;
-            border-radius: 6px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 14px;
-        }
-
-        .remove-file {
-            color: #ff6b6b;
-            cursor: pointer;
-            font-weight: bold;
-        }
-
-        .btn {
-            background: #5865F2;
-            color: white;
-            border: none;
-            padding: 12px 24px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-weight: bold;
-            transition: background 0.2s;
-            font-size: 14px;
-        }
-
-        .btn:hover {
-            background: #4752C4;
-        }
-
-        .btn-secondary {
-            background: #62646e;
-        }
-
-        .btn-secondary:hover {
-            background: #72747e;
-        }
-
-        .btn-danger {
-            background: #ff6b6b;
-        }
-
-        .btn-danger:hover {
-            background: #ff5252;
-        }
-
-        .button-group {
-            display: flex;
-            gap: 10px;
-            margin-top: 20px;
-            flex-wrap: wrap;
-        }
-
-        .stats-box {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 15px;
-            margin-top: 15px;
-        }
-
-        .stat-item {
-            background: #40424e;
-            padding: 15px;
-            border-radius: 6px;
-            text-align: center;
-        }
-
-        .stat-value {
             font-size: 24px;
-            font-weight: bold;
-            color: #5865F2;
-        }
-
-        .stat-label {
-            font-size: 12px;
-            color: #b9bbbe;
-            margin-top: 5px;
-        }
-
-        .history-item {
-            background: #40424e;
-            padding: 12px;
-            border-radius: 6px;
-            margin-bottom: 8px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .history-item-info {
-            flex: 1;
-        }
-
-        .history-item-actions {
-            display: flex;
-            gap: 8px;
-        }
-
-        .template-item {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 10px;
-            background: #40424e;
-            border-radius: 6px;
-            margin-bottom: 8px;
-        }
-
-        .loading {
-            display: inline-block;
-            width: 20px;
-            height: 20px;
-            border: 3px solid rgba(255,255,255,.3);
-            border-radius: 50%;
-            border-top-color: #5865F2;
-            animation: spin 1s ease-in-out infinite;
-        }
-
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-
-        .toast {
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            background: #2a2b38;
-            color: white;
-            padding: 15px 20px;
-            border-radius: 6px;
-            border: 1px solid #40424e;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            display: none;
-            align-items: center;
-            gap: 10px;
-            z-index: 1000;
-        }
-
-        .toast.show {
-            display: flex;
-        }
-
-        .toast.success {
-            border-left: 4px solid #4ade80;
-        }
-
-        .toast.error {
-            border-left: 4px solid #ff6b6b;
-        }
-
-        .embed-color-picker {
-            display: flex;
-            gap: 10px;
-            align-items: center;
-            margin-top: 10px;
-        }
-
-        .color-preset {
-            width: 30px;
-            height: 30px;
-            border-radius: 6px;
             cursor: pointer;
-            border: 2px solid transparent;
-            transition: border-color 0.2s;
         }
-
-        .color-preset:hover {
-            border-color: white;
+        .logo { font-size: 20px; font-weight: bold; color: #5865F2; }
+        .user-info { display: flex; align-items: center; gap: 10px; }
+        .avatar {
+            width: 40px; height: 40px; border-radius: 50%;
+            background: #5865F2; display: flex; align-items: center; justify-content: center;
+            font-weight: bold;
         }
-
-        .color-preset.selected {
-            border-color: #5865F2;
+        .logout-btn {
+            background: #5865F2; color: white; border: none;
+            padding: 8px 16px; border-radius: 6px; cursor: pointer;
         }
-
-        .field-item {
-            background: #40424e;
-            padding: 15px;
-            border-radius: 6px;
-            margin-bottom: 10px;
+        .container {
+            display: flex; flex: 1; overflow: hidden;
         }
-
-        .field-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 10px;
+        .sidebar {
+            width: 280px; background: #2a2b38; padding: 20px;
+            overflow-y: auto; border-right: 1px solid #40424e;
+            transition: transform 0.3s;
         }
-
-        .checkbox-group {
-            display: flex;
-            align-items: center;
-            gap: 8px;
+        .sidebar.collapsed { transform: translateX(-280px); }
+        .main-content {
+            flex: 1; padding: 20px; overflow-y: auto;
+            transition: margin-left 0.3s;
         }
-
-        .checkbox-group input[type="checkbox"] {
-            width: auto;
+        .main-content.expanded { margin-left: -280px; }
+        .card {
+            background: #2a2b38; border-radius: 8px; padding: 20px;
+            margin-bottom: 20px; border: 1px solid #40424e;
         }
-
+        .card h2 {
+            color: #5865F2; margin-bottom: 15px; font-size: 18px;
+            display: flex; justify-content: space-between; align-items: center;
+        }
+        .section-title { color: #5865F2; margin-bottom: 15px; font-size: 16px; }
+        .server-list, .channel-list {
+            display: flex; flex-direction: column; gap: 8px;
+        }
+        .server-item, .channel-item {
+            background: #40424e; padding: 10px; border-radius: 6px;
+            cursor: pointer; transition: background 0.2s;
+            display: flex; align-items: center; gap: 10px;
+        }
+        .server-item:hover, .channel-item:hover { background: #5865F2; }
+        .server-item.selected, .channel-item.selected { background: #5865F2; }
+        .form-group { margin-bottom: 15px; }
+        label {
+            display: block; margin-bottom: 5px; color: #b9bbbe;
+            font-size: 12px; text-transform: uppercase; font-weight: bold;
+        }
+        input, textarea, select {
+            width: 100%; padding: 10px; background: #40424e;
+            border: 1px solid #62646e; border-radius: 6px; color: white;
+        }
+        .char-counter { text-align: right; font-size: 12px; color: #b9bbbe; margin-top: 5px; }
+        .file-upload {
+            border: 2px dashed #62646e; padding: 30px; text-align: center;
+            border-radius: 6px; cursor: pointer;
+        }
+        .file-upload:hover { border-color: #5865F2; }
+        .file-list { margin-top: 15px; display: flex; flex-wrap: wrap; gap: 10px; }
+        .file-item {
+            background: #40424e; padding: 8px 12px; border-radius: 6px;
+            display: flex; align-items: center; gap: 8px;
+        }
+        .remove-file { color: #ff6b6b; cursor: pointer; font-weight: bold; }
+        .btn {
+            background: #5865F2; color: white; border: none;
+            padding: 12px 24px; border-radius: 6px; cursor: pointer;
+            font-weight: bold;
+        }
+        .btn:hover { background: #4752C4; }
+        .btn-secondary { background: #62646e; }
+        .btn-danger { background: #ff6b6b; }
+        .button-group { display: flex; gap: 10px; margin-top: 20px; flex-wrap: wrap; }
+        .loading {
+            display: inline-block; width: 20px; height: 20px;
+            border: 3px solid rgba(255,255,255,.3); border-radius: 50%;
+            border-top-color: #5865F2; animation: spin 1s ease-in-out infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .toast {
+            position: fixed; bottom: 20px; right: 20px; background: #2a2b38;
+            color: white; padding: 15px 20px; border-radius: 6px;
+            border: 1px solid #40424e; display: none; align-items: center;
+            gap: 10px; z-index: 1000;
+        }
+        .toast.show { display: flex; }
+        .toast.success { border-left: 4px solid #4ade80; }
+        .toast.error { border-left: 4px solid #ff6b6b; }
         @media (max-width: 768px) {
-            .container {
-                flex-direction: column;
-            }
-            
-            .sidebar {
-                width: 100%;
-                max-height: 200px;
-            }
-            
-            .stats-box {
-                grid-template-columns: 1fr 1fr;
-            }
+            .sidebar { width: 100%; height: 300px; position: absolute; z-index: 50; }
+            .sidebar.collapsed { transform: translateY(-300px); }
         }
     </style>
 </head>
 <body>
     {% if user_id %}
-        <!-- FIXED: Correct session variable check -->
-        <div class="header">
-            <div class="logo">Discord Message Dashboard</div>
-            <div class="user-info">
-                {% if avatar %}
-                    <img src="{{ avatar }}" alt="{{ username }}" class="avatar">
-                {% else %}
-                    <div class="avatar">{{ username[0] }}</div>
-                {% endif %}
-                <span>{{ username }}</span>
-                <button class="logout-btn" onclick="logout()">Logout</button>
+    <div class="header">
+        <div class="header-left">
+            <button class="hamburger" onclick="toggleSidebar()">☰</button>
+            <div class="logo">Discord Dashboard</div>
+        </div>
+        <div class="user-info">
+            {% if avatar %}<img src="{{ avatar }}" class="avatar">{% else %}<div class="avatar">{{ username[0] }}</div>{% endif %}
+            <span>{{ username }}</span>
+            <button class="logout-btn" onclick="logout()">Logout</button>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="sidebar {% if sidebar_collapsed %}collapsed{% endif %}" id="sidebar">
+            <div class="card">
+                <h2>Servers <span id="serverCount" style="font-size: 12px; color: #b9bbbe;">(0)</span></h2>
+                <div class="server-list" id="serverList">
+                    <div class="loading" style="margin: 20px auto;"></div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>Channels</h2>
+                <div class="channel-list" id="channelList">
+                    <i style="color: #b9bbbe;">Select a server</i>
+                </div>
+            </div>
+
+            <div class="card" id="welcomeCard" style="display: none;">
+                <h2>Welcome Setup</h2>
+                <div class="form-group">
+                    <label>Channel</label>
+                    <select id="welcomeChannel">
+                        <option value="">Choose channel...</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Message (use {user}, {server})</label>
+                    <textarea id="welcomeMsg" rows="2">Welcome {user} to {server}!</textarea>
+                </div>
+                <div class="checkbox-group" style="margin-bottom: 15px;">
+                    <input type="checkbox" id="welcomeEnabled"> <span>Enable auto-welcome</span>
+                </div>
+                <button class="btn" onclick="saveWelcome()" style="width: 100%; padding: 8px;">Save</button>
             </div>
         </div>
 
-        <div class="container">
-            <div class="sidebar">
-                <div class="card">
-                    <h2>Servers</h2>
-                    <div class="server-list" id="serverList">
-                        <div class="loading" style="margin: 20px auto;"></div>
-                    </div>
+        <div class="main-content {% if sidebar_collapsed %}expanded{% endif %}" id="mainContent">
+            <div class="card">
+                <h2>Message Composer</h2>
+                <div class="form-group">
+                    <label>Message Content</label>
+                    <textarea id="messageContent" rows="4"></textarea>
+                    <div class="char-counter" id="charCounter">0 / 2000</div>
                 </div>
 
-                <div class="card">
-                    <h2>Channels</h2>
-                    <div class="channel-list" id="channelList">
-                        <i>Select a server to view channels</i>
-                    </div>
+                <div class="section-title">Embeds</div>
+                <button class="btn btn-secondary" onclick="addEmbed()" style="margin-bottom: 15px;">+ Add Embed</button>
+                <div id="embedList"></div>
+
+                <div class="section-title">Files</div>
+                <div class="file-upload" onclick="document.getElementById('fileInput').click()">
+                    <p>📎 Click or drag files here (Max 25MB each)</p>
+                </div>
+                <input type="file" id="fileInput" multiple accept="*" style="display: none;">
+                <div class="file-list" id="fileList"></div>
+
+                <div class="button-group">
+                    <button class="btn" onclick="sendMessage()">Send Now</button>
+                    <button class="btn btn-secondary" onclick="scheduleMessage()">Schedule</button>
+                    <button class="btn btn-secondary" onclick="saveTemplate()">Save Template</button>
                 </div>
             </div>
 
-            <div class="main-content">
-                <!-- Message Composer -->
-                <div class="card">
-                    <h2>Message Composer</h2>
-                    <div class="form-group">
-                        <label>Content</label>
-                        <textarea id="messageContent" rows="4" placeholder="Enter your message..."></textarea>
-                        <div class="char-counter" id="charCounter">0 / 2000</div>
-                    </div>
-
-                    <!-- Embed Builder -->
-                    <div class="embed-builder">
-                        <h3>Embeds <button class="btn btn-secondary" onclick="addEmbed()">+ Add Embed</button></h3>
-                        <div id="embedList"></div>
-                        <div class="embed-preview" id="embedPreview" style="display: none;"></div>
-                    </div>
-
-                    <!-- File Upload -->
-                    <div class="form-group">
-                        <label>Files</label>
-                        <div class="file-upload" onclick="document.getElementById('fileInput').click()">
-                            <p>Click here or drag files to upload</p>
-                            <p style="font-size: 12px; margin-top: 8px;">Max 25MB per file</p>
+            <div class="card">
+                <h2>Saved Templates</h2>
+                <div id="templateList">
+                    {% for t in templates %}
+                    <div class="template-item">
+                        <span>{{ t.name }}</span>
+                        <div>
+                            <button class="btn btn-secondary" onclick="loadTemplate({{ t.id }})">Load</button>
+                            <button class="btn btn-danger" onclick="deleteTemplate({{ t.id }})">Delete</button>
                         </div>
-                        <input type="file" id="fileInput" multiple accept="image/*,.pdf,.txt" style="display: none;">
-                        <div class="file-list" id="fileList"></div>
                     </div>
-
-                    <!-- Actions -->
-                    <div class="button-group">
-                        <button class="btn" onclick="sendMessage()">Send Now</button>
-                        <button class="btn btn-secondary" onclick="scheduleMessage()">Schedule</button>
-                        <button class="btn btn-secondary" onclick="saveTemplate()">Save Template</button>
-                    </div>
-                </div>
-
-                <!-- Templates -->
-                <div class="card">
-                    <h2>Saved Templates</h2>
-                    <div id="templateList">
-                        {% for template in templates %}
-                            <div class="template-item">
-                                <span>{{ template.name }}</span>
-                                <button class="btn btn-secondary" style="padding: 6px 12px;" onclick="loadTemplate({{ template.id }})">Load</button>
-                                <button class="btn btn-danger" style="padding: 6px 12px;" onclick="deleteTemplate({{ template.id }})">Delete</button>
-                            </div>
-                        {% else %}
-                            <i>No templates saved yet</i>
-                        {% endfor %}
-                    </div>
-                </div>
-
-                <!-- Message History -->
-                <div class="card">
-                    <h2>Message History</h2>
-                    <div id="messageHistory">
-                        {% for message in message_history %}
-                            <div class="history-item">
-                                <div class="history-item-info">
-                                    <strong>{{ message.sent_time|default('Scheduled', true) }}</strong>
-                                    <br><small>{{ message.content[:50] }}...</small>
-                                </div>
-                                <div class="history-item-actions">
-                                    <button class="btn btn-secondary" style="padding: 6px 12px;" onclick="resendMessage({{ message.id }})">Resend</button>
-                                </div>
-                            </div>
-                        {% else %}
-                            <i>No messages yet</i>
-                        {% endfor %}
-                    </div>
+                    {% else %}
+                    <i style="color: #b9bbbe;">No templates yet</i>
+                    {% endfor %}
                 </div>
             </div>
 
-            <!-- Stats Bar -->
-            <div style="position: fixed; bottom: 0; left: 0; right: 0; background: #2a2b38; border-top: 1px solid #40424e; padding: 10px 20px; display: flex; justify-content: space-around;">
-                <div class="stat-item" style="padding: 5px; background: none;">
-                    <div class="stat-value" id="statsToday">{{ analytics.today }}</div>
-                    <div class="stat-label">Messages Today</div>
-                </div>
-                <div class="stat-item" style="padding: 5px; background: none;">
-                    <div class="stat-value" id="statsWeek">{{ analytics.week }}</div>
-                    <div class="stat-label">This Week</div>
-                </div>
-                <div class="stat-item" style="padding: 5px; background: none;">
-                    <div class="stat-value" id="statsMonth">{{ analytics.month }}</div>
-                    <div class="stat-label">This Month</div>
-                </div>
-                <div class="stat-item" style="padding: 5px; background: none;">
-                    <div class="stat-value" id="statsFiles">{{ analytics.files_today }}</div>
-                    <div class="stat-label">Files Today</div>
+            <div class="card">
+                <h2>Message History</h2>
+                <div id="historyList">
+                    {% for h in history %}
+                    <div class="history-item">
+                        <div>
+                            <strong>{{ h.sent_time|default('Scheduled', true) }}</strong><br>
+                            <small>{{ h.content[:60] }}{% if h.content|length > 60 %}...{% endif %}</small>
+                        </div>
+                        <button class="btn btn-secondary" onclick="resend({{ h.id }})">Resend</button>
+                    </div>
+                    {% else %}
+                    <i style="color: #b9bbbe;">No messages yet</i>
+                    {% endfor %}
                 </div>
             </div>
         </div>
 
-        <!-- Toast Notifications -->
-        <div id="toast" class="toast"></div>
+        <div style="position: fixed; bottom: 0; left: 0; right: 0; background: #2a2b38; border-top: 1px solid #40424e; padding: 10px 20px; display: flex; justify-content: space-around;">
+            <div class="stat-item"><div class="stat-value">{{ analytics.today }}</div><div class="stat-label">Today</div></div>
+            <div class="stat-item"><div class="stat-value">{{ analytics.week }}</div><div class="stat-label">Week</div></div>
+            <div class="stat-item"><div class="stat-value">{{ analytics.month }}</div><div class="stat-label">Month</div></div>
+            <div class="stat-item"><div class="stat-value">{{ analytics.files_today }}</div><div class="stat-label">Files</div></div>
+        </div>
+    </div>
+
+    <div id="toast" class="toast"></div>
+
     {% else %}
-        <!-- Login Page -->
-        <div style="display: flex; justify-content: center; align-items: center; height: 100vh; background: #1e1f29;">
-            <div class="card" style="text-align: center; max-width: 400px;">
-                <h1 style="color: #5865F2; margin-bottom: 20px;">Discord Message Dashboard</h1>
-                <p style="margin-bottom: 30px; color: #b9bbbe;">Professional Discord message management at your fingertips</p>
-                <a href="{{ oauth_url }}" class="btn" style="display: block; text-decoration: none;">Login with Discord</a>
-                <p style="margin-top: 20px; font-size: 12px; color: #72747e;">Secure OAuth2 authentication</p>
-            </div>
+    <div style="display: flex; justify-content: center; align-items: center; height: 100vh;">
+        <div class="card" style="text-align: center; max-width: 400px;">
+            <h1 style="color: #5865F2;">Discord Dashboard</h1>
+            <p style="margin: 20px 0; color: #b9bbbe;">Professional Discord message management</p>
+            <a href="{{ oauth_url }}" class="btn" style="display: block; text-decoration: none;">Login with Discord</a>
         </div>
+    </div>
     {% endif %}
 
     <script>
+        let servers = [];
         let selectedServer = null;
         let selectedChannels = [];
         let uploadedFiles = [];
         let embeds = [];
 
-        // Initialize
-        document.addEventListener('DOMContentLoaded', function() {
+        function toggleSidebar() {
+            const sidebar = document.getElementById('sidebar');
+            sidebar.classList.toggle('collapsed');
+            document.getElementById('mainContent').classList.toggle('expanded');
+        }
+
+        document.addEventListener('DOMContentLoaded', async () => {
             if ({{ 'true' if user_id else 'false' }}) {
-                loadServers();
+                await loadServers();
                 initFileUpload();
                 initCharCounter();
-                initEmbedBuilder();
             }
         });
 
-        // Character counter
-        function initCharCounter() {
-            const textarea = document.getElementById('messageContent');
-            const counter = document.getElementById('charCounter');
+        async function loadServers() {
+            const container = document.getElementById('serverList');
+            container.innerHTML = '<div class="loading" style="margin: 20px auto;"></div>';
             
-            textarea.addEventListener('input', function() {
-                const length = this.value.length;
-                counter.textContent = `${length} / 2000`;
-                counter.style.color = length > 2000 ? '#ff6b6b' : '#b9bbbe';
-            });
-        }
-
-        // File upload
-        function initFileUpload() {
-            const dropZone = document.querySelector('.file-upload');
-            const fileInput = document.getElementById('fileInput');
-            
-            dropZone.addEventListener('dragover', (e) => {
-                e.preventDefault();
-                dropZone.style.borderColor = '#5865F2';
-            });
-            
-            dropZone.addEventListener('dragleave', () => {
-                dropZone.style.borderColor = '#62646e';
-            });
-            
-            dropZone.addEventListener('drop', (e) => {
-                e.preventDefault();
-                dropZone.style.borderColor = '#62646e';
-                const files = Array.from(e.dataTransfer.files);
-                uploadFiles(files);
-            });
-            
-            fileInput.addEventListener('change', (e) => {
-                const files = Array.from(e.target.files);
-                uploadFiles(files);
-            });
-        }
-
-        async function uploadFiles(files) {
-            const formData = new FormData();
-            files.forEach(file => formData.append('files', file));
-            
-            const response = await fetch('/api/upload', {
-                method: 'POST',
-                body: formData,
-                headers: {
-                    'X-Requested-With': 'XMLHttpRequest'
-                }
-            });
-            
-            const result = await response.json();
-            if (result.success) {
-                result.files.forEach(file => uploadedFiles.push(file));
-                renderFileList();
-                showToast('Files uploaded successfully', 'success');
-            } else {
-                showToast(result.error || 'Upload failed', 'error');
+            try {
+                const res = await fetch('/api/guilds');
+                const data = await res.json();
+                
+                if (!res.ok) throw new Error(data.error || 'Failed to load');
+                
+                servers = data;
+                document.getElementById('serverCount').textContent = `(${data.length})`;
+                
+                container.innerHTML = data.map(s => `
+                    <div class="server-item" onclick="selectServer('${s.id}', this)">
+                        ${s.icon ? `<img src="${s.icon}" style="width: 32px; height: 32px; border-radius: 50%;">` : `<div style="width: 32px; height: 32px; background: #5865F2; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold;">${s.name[0]}</div>`}
+                        <span>${s.name}</span>
+                    </div>
+                `).join('');
+            } catch (e) {
+                container.innerHTML = `<div style="color: #ff6b6b;">❌ ${e.message}</div>`;
             }
         }
 
-        function renderFileList() {
+        async function selectServer(serverId, el) {
+            document.querySelectorAll('.server-item').forEach(i => i.classList.remove('selected'));
+            el.classList.add('selected');
+            selectedServer = serverId;
+            selectedChannels = [];
+            
+            // Load channels
+            const container = document.getElementById('channelList');
+            container.innerHTML = '<div class="loading" style="margin: 20px auto;"></div>';
+            
+            try {
+                const res = await fetch(`/api/channels?guild_id=${serverId}`);
+                const data = await res.json();
+                
+                if (!res.ok) throw new Error(data.error || 'Failed to load channels');
+                
+                container.innerHTML = data.map(c => `
+                    <div class="channel-item" onclick="selectChannel('${c.id}', this)">#${c.name}</div>
+                `).join('');
+                
+                // Load welcome config for this server
+                await loadWelcomeConfig(serverId);
+                document.getElementById('welcomeCard').style.display = 'block';
+                
+            } catch (e) {
+                container.innerHTML = `<div style="color: #ff6b6b;">❌ ${e.message}</div>`;
+            }
+        }
+
+        function selectChannel(channelId, el) {
+            el.classList.toggle('selected');
+            if (el.classList.contains('selected')) {
+                if (!selectedChannels.includes(channelId)) selectedChannels.push(channelId);
+            } else {
+                selectedChannels = selectedChannels.filter(id => id !== channelId);
+            }
+        }
+
+        async function loadWelcomeConfig(guildId) {
+            try {
+                const res = await fetch(`/api/welcome/config?guild_id=${guildId}`);
+                const data = await res.json();
+                
+                document.getElementById('welcomeChannel').value = data.channel_id || '';
+                document.getElementById('welcomeMsg').value = data.message || 'Welcome {user} to {server}!';
+                document.getElementById('welcomeEnabled').checked = data.enabled || false;
+            } catch {}
+        }
+
+        async function saveWelcome() {
+            if (!selectedServer) return showToast('Select server first', 'error');
+            
+            const data = {
+                guild_id: selectedServer,
+                channel_id: document.getElementById('welcomeChannel').value,
+                message: document.getElementById('welcomeMsg').value,
+                embeds: [],
+                enabled: document.getElementById('welcomeEnabled').checked
+            };
+            
+            const res = await fetch('/api/welcome/config', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(data)
+            });
+            
+            const result = await res.json();
+            showToast(result.message || 'Saved!', res.ok ? 'success' : 'error');
+        }
+
+        function initCharCounter() {
+            const ta = document.getElementById('messageContent');
+            const counter = document.getElementById('charCounter');
+            ta.addEventListener('input', () => {
+                counter.textContent = `${ta.value.length} / 2000`;
+                counter.style.color = ta.value.length > 2000 ? '#ff6b6b' : '#b9bbbe';
+            });
+        }
+
+        function initFileUpload() {
+            const zone = document.querySelector('.file-upload');
+            const input = document.getElementById('fileInput');
+            
+            zone.addEventListener('dragover', e => { e.preventDefault(); zone.style.borderColor = '#5865F2'; });
+            zone.addEventListener('dragleave', () => zone.style.borderColor = '#62646e');
+            zone.addEventListener('drop', e => { e.preventDefault(); zone.style.borderColor = '#62646e'; uploadFiles(Array.from(e.dataTransfer.files)); });
+            input.addEventListener('change', e => uploadFiles(Array.from(e.target.files)));
+        }
+
+        async function uploadFiles(files) {
+            const form = new FormData();
+            files.forEach(f => form.append('files', f));
+            
+            const res = await fetch('/api/files', { method: 'POST', body: form });
+            const data = await res.json();
+            
+            if (data.success) {
+                uploadedFiles.push(...data.files);
+                renderFiles();
+                showToast('Files uploaded', 'success');
+            } else {
+                showToast(data.error, 'error');
+            }
+        }
+
+        function renderFiles() {
             const container = document.getElementById('fileList');
-            container.innerHTML = uploadedFiles.map(file => `
+            container.innerHTML = uploadedFiles.map(f => `
                 <div class="file-item">
-                    <span>${file.filename}</span>
-                    <span class="remove-file" onclick="removeFile('${file.path}')">×</span>
+                    <span>${f.filename}</span>
+                    <span class="remove-file" onclick="removeFile('${f.path}')">×</span>
                 </div>
             `).join('');
         }
 
         function removeFile(path) {
             uploadedFiles = uploadedFiles.filter(f => f.path !== path);
-            renderFileList();
-        }
-
-        // Embed builder
-        function initEmbedBuilder() {
-            document.getElementById('messageContent').addEventListener('input', updateEmbedPreview);
+            renderFiles();
         }
 
         function addEmbed() {
-            if (embeds.length >= 10) {
-                showToast('Maximum 10 embeds allowed', 'error');
-                return;
-            }
-            
-            const embed = {
-                title: '',
-                description: '',
-                color: '#5865F2',
-                author: { name: '', url: '', icon_url: '' },
-                fields: [],
-                thumbnail: '',
-                image: '',
-                footer: { text: '', icon_url: '' },
-                timestamp: false
-            };
-            
-            embeds.push(embed);
-            renderEmbedList();
+            if (embeds.length >= 10) return showToast('Max 10 embeds', 'error');
+            embeds.push({ title: '', description: '', color: '#5865F2', author: { name: '', url: '', icon_url: '' }, fields: [], thumbnail: '', image: '', footer: { text: '' }, timestamp: false });
+            renderEmbeds();
         }
 
-        function removeEmbed(index) {
-            embeds.splice(index, 1);
-            renderEmbedList();
+        function removeEmbed(i) {
+            embeds.splice(i, 1);
+            renderEmbeds();
         }
 
-        function addField(embedIndex) {
-            embeds[embedIndex].fields.push({
-                name: '',
-                value: '',
-                inline: true
-            });
-            renderEmbedList();
+        function addField(i) {
+            embeds[i].fields.push({ name: '', value: '', inline: true });
+            renderEmbeds();
         }
 
-        function removeField(embedIndex, fieldIndex) {
-            embeds[embedIndex].fields.splice(fieldIndex, 1);
-            renderEmbedList();
+        function removeField(i, fi) {
+            embeds[i].fields.splice(fi, 1);
+            renderEmbeds();
         }
 
-        function renderEmbedList() {
+        function renderEmbeds() {
             const container = document.getElementById('embedList');
-            container.innerHTML = embeds.map((embed, index) => `
-                <div class="field-item">
-                    <div class="field-header">
-                        <strong>Embed #${index + 1}</strong>
-                        <button class="btn btn-danger" style="padding: 4px 8px;" onclick="removeEmbed(${index})">Remove</button>
-                    </div>
-                    <div class="form-group"><input type="text" placeholder="Title" value="${embed.title}" onchange="updateEmbed(${index}, 'title', this.value)"></div>
-                    <div class="form-group"><textarea rows="3" placeholder="Description" onchange="updateEmbed(${index}, 'description', this.value)">${embed.description}</textarea></div>
-                    <div class="embed-color-picker">
-                        <input type="color" value="${embed.color}" onchange="updateEmbed(${index}, 'color', this.value)">
-                        <span>Color</span>
-                    </div>
-                    <div class="form-group"><input type="text" placeholder="Author Name" value="${embed.author.name}" onchange="updateEmbed(${index}, 'author.name', this.value)"></div>
-                    <div class="form-group"><input type="text" placeholder="Author URL" value="${embed.author.url}" onchange="updateEmbed(${index}, 'author.url', this.value)"></div>
-                    <div class="form-group"><input type="text" placeholder="Thumbnail URL" value="${embed.thumbnail}" onchange="updateEmbed(${index}, 'thumbnail', this.value)"></div>
-                    <div class="form-group"><input type="text" placeholder="Image URL" value="${embed.image}" onchange="updateEmbed(${index}, 'image', this.value)"></div>
-                    <div class="form-group"><input type="text" placeholder="Footer Text" value="${embed.footer.text}" onchange="updateEmbed(${index}, 'footer.text', this.value)"></div>
-                    <div class="checkbox-group"><input type="checkbox" ${embed.timestamp ? 'checked' : ''} onchange="updateEmbed(${index}, 'timestamp', this.checked)"> <span>Include Timestamp</span></div>
-                    <div style="margin-top: 10px;">
-                        <strong>Fields</strong>
-                        <button class="btn btn-secondary" style="padding: 4px 8px; margin-left: 10px;" onclick="addField(${index})">+ Add Field</button>
-                        <div style="margin-top: 10px;">
-                            ${embed.fields.map((field, fIndex) => `
-                                <div class="field-item" style="background: #62646e;">
-                                    <div class="field-header">
-                                        <strong>Field #${fIndex + 1}</strong>
-                                        <button class="btn btn-danger" style="padding: 2px 6px;" onclick="removeField(${index}, ${fIndex})">×</button>
-                                    </div>
-                                    <div class="form-group"><input type="text" placeholder="Field Name" value="${field.name}" onchange="updateField(${index}, ${fIndex}, 'name', this.value)"></div>
-                                    <div class="form-group"><input type="text" placeholder="Field Value" value="${field.value}" onchange="updateField(${index}, ${fIndex}, 'value', this.value)"></div>
-                                    <div class="checkbox-group"><input type="checkbox" ${field.inline ? 'checked' : ''} onchange="updateField(${index}, ${fIndex}, 'inline', this.checked)"> <span>Inline</span></div>
-                                </div>
-                            `).join('')}
-                        </div>
-                    </div>
-                </div>
-            `).join('');
-            
-            updateEmbedPreview();
-        }
-
-        function updateEmbed(index, path, value) {
-            const keys = path.split('.');
-            let obj = embeds[index];
-            
-            for (let i = 0; i < keys.length - 1; i++) {
-                obj = obj[keys[i]];
-            }
-            
-            obj[keys[keys.length - 1]] = value;
-            updateEmbedPreview();
-        }
-
-        function updateField(embedIndex, fieldIndex, key, value) {
-            embeds[embedIndex].fields[fieldIndex][key] = value;
-            updateEmbedPreview();
-        }
-
-        function updateEmbedPreview() {
-            const preview = document.getElementById('embedPreview');
-            if (embeds.length === 0) {
-                preview.style.display = 'none';
-                return;
-            }
-            
-            preview.style.display = 'block';
-            preview.innerHTML = embeds.map(embed => `
-                <div style="background: ${embed.color}; padding: 1px; border-radius: 4px; margin-bottom: 10px;">
-                    <div style="background: #2a2b38; padding: 15px; border-radius: 3px;">
-                        ${embed.author.name ? `<div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
-                            ${embed.author.icon_url ? `<img src="${embed.author.icon_url}" style="width: 24px; height: 24px; border-radius: 50%;">` : ''}
-                            <span style="font-weight: bold;">${embed.author.name}</span>
-                        </div>` : ''}
-                        ${embed.title ? `<h3 style="margin: 8px 0; color: ${embed.color};">${embed.title}</h3>` : ''}
-                        ${embed.description ? `<p style="color: #b9bbbe; margin: 8px 0;">${embed.description}</p>` : ''}
-                        ${embed.thumbnail ? `<img src="${embed.thumbnail}" style="max-width: 80px; max-height: 80px; float: right; border-radius: 4px;">` : ''}
-                        ${embed.fields.map(field => `
-                            <div style="margin: 8px 0; ${field.inline ? 'display: inline-block; width: 49%;' : ''}">
-                                <strong>${field.name}</strong>
-                                <div style="color: #b9bbbe;">${field.value}</div>
+            container.innerHTML = embeds.map((e, i) => `
+                <div class="card">
+                    <h2>Embed #${i + 1} <button class="btn btn-danger" onclick="removeEmbed(${i})" style="padding: 4px 8px;">Remove</button></h2>
+                    <div class="form-group"><input type="text" placeholder="Title" value="${e.title}" onchange="embeds[${i}].title = this.value"></div>
+                    <div class="form-group"><textarea rows="3" placeholder="Description" onchange="embeds[${i}].description = this.value">${e.description}</textarea></div>
+                    <div class="form-group"><input type="color" value="${e.color}" onchange="embeds[${i}].color = this.value"> Color</div>
+                    <div class="section-title">Fields <button class="btn btn-secondary" onclick="addField(${i})" style="padding: 4px 8px;">+</button></div>
+                    ${e.fields.map((f, fi) => `
+                        <div class="field-item">
+                            <div style="display: flex; justify-content: space-between;">
+                                <strong>Field #${fi + 1}</strong>
+                                <button class="btn btn-danger" onclick="removeField(${i}, ${fi})" style="padding: 2px 6px;">×</button>
                             </div>
-                        `).join('')}
-                        ${embed.image ? `<img src="${embed.image}" style="max-width: 100%; border-radius: 4px; margin-top: 8px;">` : ''}
-                        ${embed.footer.text ? `<div style="margin-top: 10px; padding-top: 10px; border-top: 1px solid #40424e; font-size: 12px; color: #72747e;">
-                            ${embed.footer.icon_url ? `<img src="${embed.footer.icon_url}" style="width: 20px; height: 20px; border-radius: 50%; vertical-align: middle; margin-right: 8px;">` : ''}
-                            ${embed.footer.text}
-                            ${embed.timestamp ? ` • ${new Date().toLocaleString()}` : ''}
-                        </div>` : ''}
-                    </div>
+                            <input type="text" placeholder="Name" value="${f.name}" onchange="embeds[${i}].fields[${fi}].name = this.value">
+                            <input type="text" placeholder="Value" value="${f.value}" onchange="embeds[${i}].fields[${fi}].value = this.value" style="margin-top: 5px;">
+                            <label><input type="checkbox" ${f.inline ? 'checked' : ''} onchange="embeds[${i}].fields[${fi}].inline = this.checked"> Inline</label>
+                        </div>
+                    `).join('')}
                 </div>
             `).join('');
         }
 
-        // Load servers
-        async function loadServers() {
-            try {
-                const response = await fetch('/api/guilds');
-                const servers = await response.json();
-                
-                const container = document.getElementById('serverList');
-                container.innerHTML = servers.map(server => `
-                    <div class="server-item" onclick="selectServer('${server.id}', this)">
-                        ${server.icon ? `<img src="${server.icon}" style="width: 32px; height: 32px; border-radius: 50%;">` : '<div style="width: 32px; height: 32px; background: #5865F2; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold;">' + server.name[0] + '</div>'}
-                        <span>${server.name}</span>
-                    </div>
-                `).join('');
-            } catch (e) {
-                showToast('Failed to load servers', 'error');
-            }
-        }
-
-        async function selectServer(serverId, element) {
-            document.querySelectorAll('.server-item').forEach(item => item.classList.remove('selected'));
-            element.classList.add('selected');
-            selectedServer = serverId;
-            selectedChannels = [];
-            
-            try {
-                const response = await fetch(`/api/channels?guild_id=${serverId}`);
-                const channels = await response.json();
-                
-                const container = document.getElementById('channelList');
-                container.innerHTML = channels.map(channel => `
-                    <div class="channel-item" onclick="selectChannel('${channel.id}', this)">
-                        <span>#${channel.name}</span>
-                    </div>
-                `).join('');
-            } catch (e) {
-                showToast('Failed to load channels', 'error');
-            }
-        }
-
-        function selectChannel(channelId, element) {
-            element.classList.toggle('selected');
-            if (element.classList.contains('selected')) {
-                selectedChannels.push(channelId);
-            } else {
-                selectedChannels = selectedChannels.filter(id => id !== channelId);
-            }
-        }
-
-        // Send message
         async function sendMessage() {
             const content = document.getElementById('messageContent').value;
             
-            if (selectedChannels.length === 0) {
-                showToast('Please select at least one channel', 'error');
-                return;
-            }
-            
-            if (!content && embeds.length === 0 && uploadedFiles.length === 0) {
-                showToast('Message cannot be empty', 'error');
-                return;
-            }
+            if (selectedChannels.length === 0) return showToast('Select channels', 'error');
+            if (!content && embeds.length === 0 && uploadedFiles.length === 0) return showToast('Message empty', 'error');
             
             const data = {
                 channel_ids: selectedChannels,
@@ -1494,54 +1102,44 @@ HTML_TEMPLATE = '''
                 files: uploadedFiles.map(f => f.path)
             };
             
-            const response = await fetch('/api/send', {
+            const res = await fetch('/api/send', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(data)
             });
             
-            const result = await response.json();
+            const result = await res.json();
+            showToast(result.success ? 'Message sent!' : result.error || 'Failed', result.success ? 'success' : 'error');
+            
             if (result.success) {
-                showToast('Message sent successfully!', 'success');
                 document.getElementById('messageContent').value = '';
-                embeds = [];
-                uploadedFiles = [];
-                renderEmbedList();
-                renderFileList();
-            } else {
-                showToast('Failed to send message', 'error');
+                embeds = []; uploadedFiles = [];
+                renderEmbeds(); renderFiles();
             }
         }
 
-        // Schedule message
         function scheduleMessage() {
-            const scheduledTime = prompt('Enter scheduled time (in seconds since epoch):');
-            if (!scheduledTime) return;
+            const now = Math.floor(Date.now() / 1000);
+            const time = prompt(`Schedule time (seconds since epoch)\\nCurrent: ${now}\\n5 min from now: ${now + 300}`);
+            if (!time) return;
             
             const data = {
                 channel_ids: selectedChannels,
                 content: document.getElementById('messageContent').value,
                 embeds: embeds,
                 files: uploadedFiles.map(f => f.path),
-                scheduled_time: scheduledTime
+                scheduled_time: parseInt(time)
             };
             
             fetch('/api/schedule', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(data)
-            }).then(r => r.json()).then(result => {
-                if (result.success) {
-                    showToast('Message scheduled successfully!', 'success');
-                } else {
-                    showToast('Failed to schedule message', 'error');
-                }
-            });
+            }).then(r => r.json()).then(d => showToast(d.success ? 'Scheduled!' : d.error || 'Failed', d.success ? 'success' : 'error'));
         }
 
-        // Templates
-        function saveTemplate() {
-            const name = prompt('Enter template name:');
+        async function saveTemplate() {
+            const name = prompt('Template name:');
             if (!name) return;
             
             const data = {
@@ -1550,59 +1148,46 @@ HTML_TEMPLATE = '''
                 embeds: embeds
             };
             
-            fetch('/api/templates', {
+            const res = await fetch('/api/templates', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(data)
-            }).then(r => r.json()).then(result => {
-                if (result.success) {
-                    showToast('Template saved!', 'success');
-                    location.reload();
-                } else {
-                    showToast('Failed to save template', 'error');
-                }
             });
-        }
-
-        function loadTemplate(id) {
-            fetch('/api/templates').then(r => r.json()).then(templates => {
-                const template = templates.find(t => t.id === id);
-                if (template) {
-                    document.getElementById('messageContent').value = template.content;
-                    embeds = JSON.parse(template.embed_data);
-                    renderEmbedList();
-                    showToast('Template loaded!', 'success');
-                }
-            });
-        }
-
-        function deleteTemplate(id) {
-            if (!confirm('Delete this template?')) return;
             
-            fetch(`/api/templates?id=${id}`, {method: 'DELETE'})
-                .then(r => r.json())
-                .then(result => {
-                    if (result.success) {
-                        showToast('Template deleted!', 'success');
-                        location.reload();
-                    }
-                });
+            const result = await res.json();
+            showToast(result.success ? 'Template saved!' : result.error || 'Failed', result.success ? 'success' : 'error');
+            if (result.success) location.reload();
         }
 
-        // Logout
+        async function loadTemplate(id) {
+            const res = await fetch('/api/templates');
+            const templates = await res.json();
+            const t = templates.find(x => x.id === id);
+            if (t) {
+                document.getElementById('messageContent').value = t.content;
+                embeds = JSON.parse(t.embed_data) || [];
+                renderEmbeds();
+                showToast('Template loaded', 'success');
+            }
+        }
+
+        async function deleteTemplate(id) {
+            if (!confirm('Delete?')) return;
+            const res = await fetch(`/api/templates?id=${id}`, { method: 'DELETE' });
+            const result = await res.json();
+            showToast(result.success ? 'Deleted' : 'Failed', result.success ? 'success' : 'error');
+            if (result.success) location.reload();
+        }
+
         function logout() {
             window.location.href = '/logout';
         }
 
-        // Toast
-        function showToast(message, type = 'success') {
+        function showToast(msg, type = 'success') {
             const toast = document.getElementById('toast');
-            toast.textContent = message;
+            toast.textContent = msg;
             toast.className = `toast ${type} show`;
-            
-            setTimeout(() => {
-                toast.classList.remove('show');
-            }, 3000);
+            setTimeout(() => toast.classList.remove('show'), 3000);
         }
     </script>
 </body>
@@ -1611,22 +1196,20 @@ HTML_TEMPLATE = '''
 
 @bot.event
 async def on_ready():
-    print(f'Bot is ready as {bot.user}')
-    bot.loop.create_task(process_scheduled_messages())
+    global bot_ready
+    bot_ready = True
+    print(f"✅ Bot ready: {bot.user}")
+    bot.loop.create_task(process_scheduled())
 
 def run_bot():
     try:
         bot.run(CONFIG['bot_token'])
     except Exception as e:
-        print(f"Bot connection failed: {e}")
+        print(f"❌ Bot error: {e}")
 
 def run_flask():
-    app.run(host=CONFIG['app_host'], port=CONFIG['app_port'])
+    app.run(host=CONFIG['app_host'], port=CONFIG['app_port'], debug=False)
 
 if __name__ == '__main__':
-    # Run bot in a separate thread
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-    
-    # Run Flask app
+    threading.Thread(target=run_bot, daemon=True).start()
     run_flask()
