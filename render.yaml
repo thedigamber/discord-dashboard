@@ -3,8 +3,8 @@ services:
     name: discord-message-dashboard
     env: python
     buildCommand: |
-      pip install --upgrade pip
-      pip install discord.py==2.3.2 flask==2.3.3 audioloop-lts==1.0.0 Pillow==10.0.0 requests==2.31.0
+  python -m pip install --upgrade pip
+  python -m pip install discord.py==2.3.2 flask==2.3.3
     startCommand: python main.py
     envVars:
       - key: DISCORD_CLIENT_ID
