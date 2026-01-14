@@ -1,12 +1,24 @@
-# ========== ULTIMATE FIX FOR AUDIOOP ERROR ==========
+# ========== ULTIMATE DISCORD MESSAGE DASHBOARD PRO ==========
 import sys
 import types
+import os
+import time
+import asyncio
+import json
+import threading
+import sqlite3
+from datetime import datetime, timedelta
+from io import BytesIO
+import base64
+import uuid
+import schedule
+import aiofiles
+from pathlib import Path
 
-# Block audioop import completely
+# ========== FIX AUDIOOP ERROR ==========
 class AudioopBlocker:
     def find_spec(self, fullname, path, target=None):
         if fullname in ['audioop', '_audioop']:
-            # Return a spec with a dummy loader
             return types.SimpleNamespace(
                 loader=None,
                 origin='dummy',
@@ -14,31 +26,23 @@ class AudioopBlocker:
             )
         return None
 
-# Insert our blocker first
 sys.meta_path.insert(0, AudioopBlocker())
 
-# Create dummy audioop module before discord tries to import it
 audioop_module = types.ModuleType('audioop')
 audioop_module.ulaw2lin = lambda x, y: x
 audioop_module.lin2ulaw = lambda x, y: x
-audioop_module.lin2adpcm = lambda x, y, z: (x, None)
-audioop_module.adpcm2lin = lambda x, y, z: x
 sys.modules['audioop'] = audioop_module
-
-# Create dummy _audioop module
 sys.modules['_audioop'] = types.ModuleType('_audioop')
 
-# NOW import everything else
+# ========== IMPORTS ==========
 import discord
 from discord.ext import commands
-from flask import Flask, render_template_string, redirect, url_for, session, request, jsonify
-import os
-import time
-import asyncio
-import json
-import threading
-from datetime import datetime
+from flask import Flask, render_template_string, redirect, url_for, session, request, jsonify, send_file
+from flask_cors import CORS
 import requests
+from werkzeug.utils import secure_filename
+from PIL import Image
+import io
 
 # ========== CONFIGURATION ==========
 DISCORD_CLIENT_ID = os.environ.get('DISCORD_CLIENT_ID')
@@ -50,6 +54,91 @@ FLASK_SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', 'your-secret-key-here')
 # ========== FLASK APP ==========
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
+CORS(app)
+
+# ========== DATABASE SETUP ==========
+def init_db():
+    conn = sqlite3.connect('dashboard.db')
+    cursor = conn.cursor()
+    
+    # Users table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            username TEXT,
+            avatar TEXT,
+            access_token TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Messages table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS messages (
+            id TEXT PRIMARY KEY,
+            user_id TEXT,
+            guild_id TEXT,
+            channel_id TEXT,
+            message_id TEXT,
+            title TEXT,
+            content TEXT,
+            embed_data TEXT,
+            file_data TEXT,
+            is_embed INTEGER DEFAULT 0,
+            is_scheduled INTEGER DEFAULT 0,
+            scheduled_time TIMESTAMP,
+            sent_time TIMESTAMP,
+            status TEXT DEFAULT 'sent',
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    
+    # Templates table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS templates (
+            id TEXT PRIMARY KEY,
+            user_id TEXT,
+            name TEXT,
+            title TEXT,
+            content TEXT,
+            embed_data TEXT,
+            is_embed INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    
+    # Analytics table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS analytics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date DATE,
+            messages_sent INTEGER DEFAULT 0,
+            files_sent INTEGER DEFAULT 0,
+            embeds_sent INTEGER DEFAULT 0,
+            errors INTEGER DEFAULT 0
+        )
+    ''')
+    
+    # Files table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS files (
+            id TEXT PRIMARY KEY,
+            user_id TEXT,
+            filename TEXT,
+            file_type TEXT,
+            file_size INTEGER,
+            file_data BLOB,
+            uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+init_db()
 
 # ========== DISCORD BOT ==========
 intents = discord.Intents.default()
@@ -58,577 +147,650 @@ intents.messages = True
 intents.message_content = True
 intents.emojis = True
 intents.reactions = True
+intents.members = True
 
 bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
-# ========== STORAGE ==========
+# ========== GLOBAL STORAGE ==========
 user_sessions = {}
+uploaded_files = {}
 message_history = []
 bot_guilds = []
 available_emojis = {}
+active_schedules = {}
+bot_start_time = time.time()
 
-# ========== HTML TEMPLATE ==========
+# ========== FILE UPLOAD CONFIG ==========
+ALLOWED_EXTENSIONS = {
+    'image': ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'],
+    'document': ['pdf', 'txt', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx'],
+    'audio': ['mp3', 'wav', 'ogg', 'm4a'],
+    'video': ['mp4', 'mov', 'avi', 'mkv', 'webm'],
+    'archive': ['zip', 'rar', '7z', 'tar', 'gz']
+}
+
+UPLOAD_FOLDER = 'uploads'
+Path(UPLOAD_FOLDER).mkdir(exist_ok=True)
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in [
+        ext for exts in ALLOWED_EXTENSIONS.values() for ext in exts
+    ]
+
+def get_file_type(filename):
+    ext = filename.rsplit('.', 1)[1].lower()
+    for file_type, extensions in ALLOWED_EXTENSIONS.items():
+        if ext in extensions:
+            return file_type
+    return 'other'
+
+# ========== SCHEDULING SYSTEM ==========
+def run_scheduler():
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+scheduler_thread.start()
+
+# ========== HTML TEMPLATE START ==========
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
-<html>
+<html lang="en" data-theme="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🤖 Discord Message Dashboard</title>
+    <title>🚀 Discord Dashboard Pro</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
             --primary: #7289da;
+            --primary-dark: #5b6eae;
             --secondary: #43b581;
+            --secondary-dark: #3a9d6e;
             --danger: #f04747;
-            --dark: #2c2f33;
-            --darker: #23272a;
+            --warning: #faa81a;
+            --info: #00b0f4;
+            --dark: #1e1f29;
+            --darker: #16171e;
             --light: #99aab5;
             --lighter: #ffffff;
+            --card-bg: rgba(255, 255, 255, 0.05);
+            --card-border: rgba(255, 255, 255, 0.1);
+            --shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            --radius: 16px;
+            --transition: all 0.3s ease;
         }
-        
+
+        [data-theme="light"] {
+            --dark: #f8f9fa;
+            --darker: #e9ecef;
+            --light: #6c757d;
+            --lighter: #212529;
+            --card-bg: rgba(0, 0, 0, 0.03);
+            --card-border: rgba(0, 0, 0, 0.1);
+        }
+
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
         }
-        
+
         body {
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            background: linear-gradient(135deg, var(--darker) 0%, var(--dark) 100%);
             color: var(--lighter);
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            font-family: 'Poppins', sans-serif;
             min-height: 100vh;
             padding: 20px;
+            transition: var(--transition);
         }
-        
+
         .container {
-            max-width: 1400px;
+            max-width: 1800px;
             margin: 0 auto;
         }
-        
+
         /* Header */
         .header {
-            text-align: center;
-            padding: 50px 30px;
-            background: rgba(255, 255, 255, 0.05);
-            backdrop-filter: blur(10px);
-            border-radius: 25px;
-            margin-bottom: 40px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+            background: var(--card-bg);
+            backdrop-filter: blur(20px);
+            border-radius: var(--radius);
+            padding: 40px;
+            margin-bottom: 30px;
+            border: 1px solid var(--card-border);
+            box-shadow: var(--shadow);
+            position: relative;
+            overflow: hidden;
         }
-        
+
+        .header::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+        }
+
         .title {
-            font-size: 3.5rem;
-            background: linear-gradient(90deg, #00dbde, #fc00ff);
+            font-size: 3.2rem;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
-            margin-bottom: 15px;
+            margin-bottom: 10px;
             font-weight: 800;
         }
-        
+
         .subtitle {
-            font-size: 1.3rem;
+            font-size: 1.2rem;
             color: var(--light);
-            margin-bottom: 30px;
+            max-width: 800px;
+            line-height: 1.6;
         }
-        
+
+        /* Theme Toggle */
+        .theme-toggle {
+            position: absolute;
+            top: 30px;
+            right: 30px;
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 50px;
+            padding: 10px 20px;
+            display: flex;
+            gap: 15px;
+            cursor: pointer;
+            transition: var(--transition);
+        }
+
+        .theme-toggle:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+
         /* Login Button */
         .login-btn {
             display: inline-flex;
             align-items: center;
             gap: 15px;
-            background: var(--primary);
+            background: linear-gradient(135deg, var(--primary), var(--primary-dark));
             color: white;
-            padding: 18px 40px;
+            padding: 18px 45px;
             border: none;
-            border-radius: 12px;
+            border-radius: 50px;
             font-size: 1.3rem;
             font-weight: 600;
             cursor: pointer;
             text-decoration: none;
-            transition: all 0.3s;
-            box-shadow: 0 5px 15px rgba(114, 137, 218, 0.4);
+            transition: var(--transition);
+            box-shadow: 0 5px 20px rgba(114, 137, 218, 0.4);
+            margin-top: 30px;
         }
-        
+
         .login-btn:hover {
             transform: translateY(-3px);
-            box-shadow: 0 8px 25px rgba(114, 137, 218, 0.6);
-            background: #5b6eae;
+            box-shadow: 0 8px 30px rgba(114, 137, 218, 0.6);
         }
-        
+
         /* Dashboard Layout */
         .dashboard {
             display: grid;
-            grid-template-columns: 320px 1fr;
-            gap: 30px;
-            margin-top: 30px;
+            grid-template-columns: 320px 1fr 400px;
+            gap: 25px;
+            margin-top: 25px;
         }
-        
+
+        @media (max-width: 1400px) {
+            .dashboard {
+                grid-template-columns: 1fr;
+            }
+        }
+
         /* Sidebar */
         .sidebar {
-            background: rgba(255, 255, 255, 0.05);
-            backdrop-filter: blur(10px);
-            border-radius: 20px;
+            background: var(--card-bg);
+            backdrop-filter: blur(20px);
+            border-radius: var(--radius);
             padding: 25px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--card-border);
+            box-shadow: var(--shadow);
+            height: fit-content;
+            position: sticky;
+            top: 20px;
         }
-        
+
         .sidebar-title {
             display: flex;
             align-items: center;
             gap: 12px;
             font-size: 1.4rem;
             margin-bottom: 25px;
-            color: var(--lighter);
             padding-bottom: 15px;
-            border-bottom: 2px solid rgba(255, 255, 255, 0.1);
+            border-bottom: 2px solid var(--card-border);
         }
-        
-        /* Guild List */
-        .guild-list {
-            max-height: 600px;
-            overflow-y: auto;
-            padding-right: 10px;
-        }
-        
-        .guild-list::-webkit-scrollbar {
-            width: 8px;
-        }
-        
-        .guild-list::-webkit-scrollbar-track {
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 10px;
-        }
-        
-        .guild-list::-webkit-scrollbar-thumb {
-            background: linear-gradient(180deg, #00dbde, #fc00ff);
-            border-radius: 10px;
-        }
-        
-        .guild-item {
-            display: flex;
-            align-items: center;
-            gap: 15px;
-            padding: 18px;
-            background: rgba(255, 255, 255, 0.08);
-            border-radius: 12px;
-            margin-bottom: 12px;
-            cursor: pointer;
-            transition: all 0.3s;
-            border: 2px solid transparent;
-        }
-        
-        .guild-item:hover {
-            background: rgba(255, 255, 255, 0.12);
-            transform: translateX(8px);
-            border-color: var(--primary);
-        }
-        
-        .guild-item.active {
-            background: linear-gradient(135deg, rgba(114, 137, 218, 0.2), rgba(67, 181, 129, 0.2));
-            border-color: var(--secondary);
-        }
-        
-        .guild-icon {
-            width: 55px;
-            height: 55px;
-            border-radius: 50%;
-            background: var(--dark);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 24px;
-            overflow: hidden;
-        }
-        
-        .guild-icon img {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-        }
-        
-        .guild-info {
-            flex: 1;
-        }
-        
-        .guild-name {
-            font-size: 1.1rem;
-            font-weight: 600;
-            margin-bottom: 5px;
-        }
-        
-        .guild-stats {
-            font-size: 0.85rem;
-            color: var(--light);
-            display: flex;
-            gap: 10px;
-        }
-        
+
         /* Main Content */
         .main-content {
-            background: rgba(255, 255, 255, 0.05);
-            backdrop-filter: blur(10px);
-            border-radius: 20px;
+            background: var(--card-bg);
+            backdrop-filter: blur(20px);
+            border-radius: var(--radius);
             padding: 30px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--card-border);
+            box-shadow: var(--shadow);
         }
-        
-        /* Status Bar */
-        .status-bar {
+
+        /* Right Sidebar */
+        .right-sidebar {
+            background: var(--card-bg);
+            backdrop-filter: blur(20px);
+            border-radius: var(--radius);
+            padding: 25px;
+            border: 1px solid var(--card-border);
+            box-shadow: var(--shadow);
+            height: fit-content;
+            position: sticky;
+            top: 20px;
+        }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 30px;
+            border-bottom: 2px solid var(--card-border);
+            padding-bottom: 15px;
+            flex-wrap: wrap;
+        }
+
+        .tab-btn {
+            padding: 12px 25px;
+            background: transparent;
+            border: none;
+            border-radius: 50px;
+            color: var(--light);
+            font-weight: 600;
+            cursor: pointer;
+            transition: var(--transition);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .tab-btn:hover {
+            background: rgba(255, 255, 255, 0.1);
+            color: var(--lighter);
+        }
+
+        .tab-btn.active {
+            background: var(--primary);
+            color: white;
+            box-shadow: 0 4px 15px rgba(114, 137, 218, 0.3);
+        }
+
+        /* Cards */
+        .stats-grid {
             display: grid;
-            grid-template-columns: repeat(4, 1fr);
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
             gap: 20px;
             margin-bottom: 30px;
         }
-        
-        .status-card {
-            background: rgba(255, 255, 255, 0.08);
+
+        .stat-card {
+            background: rgba(255, 255, 255, 0.05);
             padding: 25px;
-            border-radius: 15px;
-            text-align: center;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            transition: transform 0.3s;
+            border-radius: var(--radius);
+            border: 1px solid var(--card-border);
+            transition: var(--transition);
         }
-        
-        .status-card:hover {
+
+        .stat-card:hover {
             transform: translateY(-5px);
+            box-shadow: var(--shadow);
         }
-        
-        .status-icon {
+
+        .stat-icon {
             font-size: 2.5rem;
             margin-bottom: 15px;
+            color: var(--primary);
         }
-        
-        .status-value {
-            font-size: 2rem;
+
+        .stat-value {
+            font-size: 2.2rem;
             font-weight: 700;
-            color: var(--secondary);
+            color: var(--lighter);
             margin-bottom: 5px;
         }
-        
-        .status-label {
+
+        .stat-label {
             font-size: 0.9rem;
             color: var(--light);
         }
-        
-        /* Selected Guild Info */
-        .selected-info {
-            background: rgba(255, 255, 255, 0.08);
-            padding: 20px;
-            border-radius: 15px;
-            margin-bottom: 30px;
-            border-left: 5px solid var(--secondary);
-        }
-        
-        /* Channel Selector */
-        .channel-selector {
-            margin-bottom: 30px;
-        }
-        
-        .channel-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-            gap: 15px;
-            margin-top: 15px;
-        }
-        
-        .channel-card {
-            background: rgba(255, 255, 255, 0.08);
-            padding: 20px;
-            border-radius: 12px;
-            cursor: pointer;
-            transition: all 0.3s;
-            text-align: center;
-            border: 2px solid transparent;
-        }
-        
-        .channel-card:hover {
-            background: rgba(255, 255, 255, 0.12);
-            transform: translateY(-3px);
-        }
-        
-        .channel-card.active {
-            background: rgba(67, 181, 129, 0.2);
-            border-color: var(--secondary);
-        }
-        
-        .channel-icon {
-            font-size: 2rem;
-            margin-bottom: 10px;
-        }
-        
-        /* Message Form */
-        .message-form {
-            background: rgba(255, 255, 255, 0.08);
-            padding: 30px;
-            border-radius: 20px;
-            margin-bottom: 30px;
-        }
-        
-        .form-group {
+
+        /* Forms */
+        .form-section {
+            background: rgba(255, 255, 255, 0.03);
+            padding: 25px;
+            border-radius: var(--radius);
             margin-bottom: 25px;
+            border: 1px solid var(--card-border);
         }
-        
-        .form-label {
+
+        .form-title {
             display: flex;
             align-items: center;
-            gap: 10px;
-            font-size: 1.1rem;
-            font-weight: 600;
-            margin-bottom: 12px;
+            gap: 12px;
+            font-size: 1.3rem;
+            margin-bottom: 20px;
             color: var(--lighter);
         }
-        
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-label {
+            display: block;
+            margin-bottom: 10px;
+            font-weight: 600;
+            color: var(--lighter);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
         .form-control {
             width: 100%;
-            padding: 18px;
-            background: rgba(255, 255, 255, 0.1);
-            border: 2px solid rgba(255, 255, 255, 0.2);
+            padding: 16px;
+            background: rgba(255, 255, 255, 0.08);
+            border: 2px solid rgba(255, 255, 255, 0.15);
             border-radius: 12px;
             color: var(--lighter);
             font-size: 1rem;
-            transition: all 0.3s;
+            font-family: 'Poppins', sans-serif;
+            transition: var(--transition);
         }
-        
+
         .form-control:focus {
             outline: none;
-            border-color: var(--secondary);
-            box-shadow: 0 0 0 3px rgba(67, 181, 129, 0.2);
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(114, 137, 218, 0.2);
         }
-        
+
         textarea.form-control {
             min-height: 150px;
             resize: vertical;
-            font-family: 'Courier New', monospace;
         }
-        
-        /* Emoji Picker */
-        .emoji-section {
-            margin-bottom: 30px;
-        }
-        
-        .emoji-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(45px, 1fr));
-            gap: 12px;
-            margin-top: 15px;
-            max-height: 200px;
-            overflow-y: auto;
-            padding: 15px;
-            background: rgba(0, 0, 0, 0.3);
+
+        /* File Upload */
+        .file-upload {
+            border: 2px dashed var(--card-border);
             border-radius: 12px;
-        }
-        
-        .emoji-item {
-            font-size: 28px;
+            padding: 30px;
             text-align: center;
-            padding: 10px;
             cursor: pointer;
-            border-radius: 8px;
-            background: rgba(255, 255, 255, 0.05);
-            transition: all 0.2s;
+            transition: var(--transition);
+            margin-bottom: 20px;
         }
-        
-        .emoji-item:hover {
-            background: rgba(255, 255, 255, 0.15);
-            transform: scale(1.15);
+
+        .file-upload:hover {
+            border-color: var(--primary);
+            background: rgba(114, 137, 218, 0.05);
         }
-        
-        /* Preview Section */
-        .preview-section {
-            background: rgba(0, 0, 0, 0.3);
-            padding: 25px;
-            border-radius: 15px;
-            margin: 30px 0;
-            border-left: 5px solid var(--primary);
+
+        .file-upload input {
+            display: none;
         }
-        
-        .preview-title {
-            font-size: 1.2rem;
-            font-weight: 600;
+
+        .upload-icon {
+            font-size: 3rem;
+            color: var(--primary);
             margin-bottom: 15px;
-            color: var(--secondary);
         }
-        
-        .preview-content {
-            font-size: 1rem;
-            line-height: 1.6;
-            white-space: pre-wrap;
-            word-break: break-word;
-            padding: 20px;
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 10px;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }
-        
-        /* Button Group */
-        .button-group {
+
+        .file-list {
             display: flex;
-            gap: 20px;
-            margin-top: 30px;
             flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 15px;
         }
-        
+
+        .file-item {
+            background: rgba(255, 255, 255, 0.08);
+            padding: 10px 15px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 0.9rem;
+        }
+
+        .file-remove {
+            color: var(--danger);
+            cursor: pointer;
+            padding: 5px;
+        }
+
+        /* Embed Builder */
+        .embed-builder {
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .embed-preview {
+            background: #2b2d31;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-left: 4px solid var(--primary);
+        }
+
+        .embed-color-picker {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .color-option {
+            width: 40px;
+            height: 40px;
+            border-radius: 8px;
+            cursor: pointer;
+            border: 3px solid transparent;
+            transition: var(--transition);
+        }
+
+        .color-option:hover {
+            transform: scale(1.1);
+        }
+
+        .color-option.active {
+            border-color: white;
+            box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.3);
+        }
+
+        /* Schedule Form */
+        .schedule-input {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+
+        .datetime-input {
+            flex: 1;
+            display: flex;
+            gap: 10px;
+        }
+
+        /* Buttons */
         .btn {
             display: inline-flex;
             align-items: center;
-            gap: 12px;
-            padding: 18px 35px;
+            gap: 10px;
+            padding: 16px 30px;
             border: none;
             border-radius: 12px;
-            font-size: 1.1rem;
+            font-size: 1rem;
             font-weight: 600;
             cursor: pointer;
-            transition: all 0.3s;
+            transition: var(--transition);
             text-decoration: none;
+            font-family: 'Poppins', sans-serif;
         }
-        
+
         .btn-primary {
-            background: linear-gradient(135deg, var(--primary), #5b6eae);
+            background: linear-gradient(135deg, var(--primary), var(--primary-dark));
             color: white;
-            box-shadow: 0 5px 20px rgba(114, 137, 218, 0.4);
         }
-        
+
         .btn-primary:hover {
             transform: translateY(-3px);
-            box-shadow: 0 8px 25px rgba(114, 137, 218, 0.6);
+            box-shadow: 0 8px 25px rgba(114, 137, 218, 0.4);
         }
-        
+
         .btn-success {
-            background: linear-gradient(135deg, var(--secondary), #3a9d6e);
+            background: linear-gradient(135deg, var(--secondary), var(--secondary-dark));
             color: white;
-            box-shadow: 0 5px 20px rgba(67, 181, 129, 0.4);
         }
-        
+
         .btn-success:hover {
             transform: translateY(-3px);
-            box-shadow: 0 8px 25px rgba(67, 181, 129, 0.6);
+            box-shadow: 0 8px 25px rgba(67, 181, 129, 0.4);
         }
-        
-        .btn-secondary {
-            background: rgba(255, 255, 255, 0.1);
-            color: white;
-            border: 2px solid rgba(255, 255, 255, 0.2);
-        }
-        
-        .btn-secondary:hover {
-            background: rgba(255, 255, 255, 0.2);
-            transform: translateY(-3px);
-        }
-        
+
         .btn-danger {
             background: linear-gradient(135deg, var(--danger), #d63c3c);
             color: white;
         }
-        
-        /* Message Logs */
-        .message-logs {
-            margin-top: 40px;
+
+        .btn-warning {
+            background: linear-gradient(135deg, var(--warning), #e69500);
+            color: white;
         }
-        
-        .logs-header {
+
+        .btn-group {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+            margin-top: 25px;
+        }
+
+        /* Tables */
+        .data-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+
+        .data-table th {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 15px;
+            text-align: left;
+            font-weight: 600;
+            color: var(--lighter);
+            border-bottom: 2px solid var(--card-border);
+        }
+
+        .data-table td {
+            padding: 15px;
+            border-bottom: 1px solid var(--card-border);
+            color: var(--light);
+        }
+
+        .data-table tr:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        /* Modals */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            backdrop-filter: blur(10px);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal.active {
+            display: flex;
+        }
+
+        .modal-content {
+            background: var(--dark);
+            border-radius: var(--radius);
+            padding: 40px;
+            max-width: 800px;
+            width: 90%;
+            max-height: 90vh;
+            overflow-y: auto;
+            border: 1px solid var(--card-border);
+            box-shadow: var(--shadow);
+        }
+
+        .modal-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 20px;
+            margin-bottom: 30px;
         }
-        
-        .logs-container {
-            max-height: 400px;
-            overflow-y: auto;
-            padding: 20px;
-            background: rgba(0, 0, 0, 0.3);
-            border-radius: 15px;
+
+        .modal-close {
+            background: none;
+            border: none;
+            color: var(--light);
+            font-size: 1.5rem;
+            cursor: pointer;
+            padding: 5px;
         }
-        
-        .log-item {
-            background: rgba(255, 255, 255, 0.08);
-            padding: 20px;
-            border-radius: 12px;
-            margin-bottom: 15px;
-            border-left: 4px solid var(--secondary);
-            animation: slideIn 0.3s ease-out;
+
+        /* Loading */
+        .loading {
+            display: inline-block;
+            width: 50px;
+            height: 50px;
+            border: 5px solid rgba(255, 255, 255, 0.1);
+            border-radius: 50%;
+            border-top-color: var(--primary);
+            animation: spin 1s linear infinite;
         }
-        
-        @keyframes slideIn {
-            from { opacity: 0; transform: translateX(-20px); }
-            to { opacity: 1; transform: translateX(0); }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
         }
-        
-        .log-header {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 10px;
-        }
-        
-        .log-time {
-            color: var(--secondary);
-            font-size: 0.9rem;
-        }
-        
-        .log-type {
+
+        /* Toast */
+        .toast {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
             background: var(--primary);
             color: white;
-            padding: 4px 12px;
-            border-radius: 20px;
-            font-size: 0.8rem;
+            padding: 20px 30px;
+            border-radius: 12px;
             font-weight: 600;
-        }
-        
-        .log-content {
-            font-size: 0.95rem;
-            line-height: 1.5;
-            color: var(--lighter);
-        }
-        
-        /* Footer */
-        .footer {
-            text-align: center;
-            padding: 30px;
-            margin-top: 50px;
-            background: rgba(255, 255, 255, 0.05);
-            border-radius: 20px;
-            border-top: 2px solid rgba(255, 255, 255, 0.1);
-        }
-        
-        .footer-links {
-            display: flex;
-            justify-content: center;
-            gap: 30px;
-            margin: 20px 0;
-        }
-        
-        .footer-link {
-            color: var(--secondary);
-            text-decoration: none;
+            z-index: 1000;
+            box-shadow: var(--shadow);
+            animation: slideInRight 0.3s ease, fadeOut 0.3s 2.7s;
             display: flex;
             align-items: center;
-            gap: 10px;
-            transition: color 0.3s;
+            gap: 15px;
         }
-        
-        .footer-link:hover {
-            color: var(--primary);
+
+        @keyframes slideInRight {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
         }
-        
+
         /* Responsive */
-        @media (max-width: 1200px) {
-            .dashboard {
-                grid-template-columns: 1fr;
-            }
-            
-            .sidebar {
-                order: 2;
-            }
-            
-            .status-bar {
-                grid-template-columns: repeat(2, 1fr);
-            }
-        }
-        
         @media (max-width: 768px) {
             .header {
                 padding: 30px 20px;
@@ -638,11 +800,16 @@ HTML_TEMPLATE = '''
                 font-size: 2.5rem;
             }
             
-            .status-bar {
+            .dashboard {
                 grid-template-columns: 1fr;
             }
             
-            .button-group {
+            .tabs {
+                overflow-x: auto;
+                padding-bottom: 10px;
+            }
+            
+            .btn-group {
                 flex-direction: column;
             }
             
@@ -650,79 +817,84 @@ HTML_TEMPLATE = '''
                 width: 100%;
                 justify-content: center;
             }
-            
-            .channel-grid {
-                grid-template-columns: 1fr;
-            }
         }
-        
-        /* Loading Animation */
-        .loading {
-            display: inline-block;
-            width: 50px;
-            height: 50px;
-            border: 5px solid rgba(255, 255, 255, 0.3);
-            border-radius: 50%;
-            border-top-color: var(--secondary);
-            animation: spin 1s ease-in-out infinite;
-        }
-        
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-        
-        /* Toast Notifications */
-        .toast {
-            position: fixed;
-            bottom: 30px;
-            right: 30px;
-            background: var(--secondary);
-            color: white;
-            padding: 15px 25px;
-            border-radius: 10px;
-            font-weight: 600;
-            z-index: 1000;
-            animation: slideInRight 0.3s, fadeOut 0.3s 2.7s;
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
-        }
-        
-        @keyframes slideInRight {
-            from { transform: translateX(100%); opacity: 0; }
-            to { transform: translateX(0); opacity: 1; }
-        }
-        
-        @keyframes fadeOut {
-            from { opacity: 1; }
-            to { opacity: 0; }
-        }
-        
+
         /* Utility Classes */
         .hidden {
             display: none !important;
         }
-        
+
         .text-center {
             text-align: center;
         }
-        
+
         .text-success {
             color: var(--secondary) !important;
         }
-        
+
         .text-danger {
             color: var(--danger) !important;
         }
-        
+
+        .text-warning {
+            color: var(--warning) !important;
+        }
+
         .mb-3 {
             margin-bottom: 30px;
         }
-        
+
         .mt-3 {
             margin-top: 30px;
         }
-        
+
         .p-3 {
             padding: 30px;
+        }
+
+        .d-flex {
+            display: flex;
+        }
+
+        .align-center {
+            align-items: center;
+        }
+
+        .justify-between {
+            justify-content: space-between;
+        }
+
+        .gap-2 {
+            gap: 20px;
+        }
+
+        .w-100 {
+            width: 100%;
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar {
+            width: 10px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 10px;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: linear-gradient(180deg, var(--primary), var(--secondary));
+            border-radius: 10px;
+        }
+
+        /* Animation */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .animate-fadein {
+            animation: fadeIn 0.5s ease;
         }
     </style>
 </head>
@@ -731,63 +903,69 @@ HTML_TEMPLATE = '''
         {% if not user %}
         <!-- Login Page -->
         <div class="header">
-            <h1 class="title">🤖 Discord Message Dashboard</h1>
-            <p class="subtitle">Professional Dashboard to Send Messages Across All Your Discord Servers</p>
+            <h1 class="title">🚀 Discord Dashboard Pro</h1>
+            <p class="subtitle">Advanced message management system with file uploads, scheduling, analytics, and more.</p>
+            
             <a href="/login" class="login-btn">
                 <i class="fab fa-discord"></i> Login with Discord
             </a>
-            <div class="mt-3">
-                <p style="color: var(--light); font-size: 0.95rem;">
-                    <i class="fas fa-shield-alt"></i> Secure OAuth2 Authentication | 
-                    <i class="fas fa-server"></i> Multi-Server Support | 
-                    <i class="fas fa-bolt"></i> Real-time Messaging
-                </p>
+            
+            <div class="stats-grid mt-3">
+                <div class="stat-card">
+                    <div class="stat-icon">🤖</div>
+                    <div class="stat-value" id="serverCount">0</div>
+                    <div class="stat-label">Active Servers</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">📊</div>
+                    <div class="stat-value" id="totalUsers">0</div>
+                    <div class="stat-label">Total Users</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">⚡</div>
+                    <div class="stat-value">24/7</div>
+                    <div class="stat-label">Uptime</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon">🔒</div>
+                    <div class="stat-value">100%</div>
+                    <div class="stat-label">Secure</div>
+                </div>
             </div>
         </div>
-        
-        <div class="status-bar">
-            <div class="status-card">
-                <div class="status-icon">🤖</div>
-                <div class="status-value" id="serverCount">0</div>
-                <div class="status-label">Servers Online</div>
-            </div>
-            <div class="status-card">
-                <div class="status-icon">📊</div>
-                <div class="status-value" id="totalUsers">0</div>
-                <div class="status-label">Total Users</div>
-            </div>
-            <div class="status-card">
-                <div class="status-icon">⚡</div>
-                <div class="status-value">24/7</div>
-                <div class="status-label">Uptime</div>
-            </div>
-            <div class="status-card">
-                <div class="status-icon">🔒</div>
-                <div class="status-value">100%</div>
-                <div class="status-label">Secure</div>
-            </div>
-        </div>
-        
-        <div class="p-3" style="background: rgba(255,255,255,0.05); border-radius: 20px; margin-top: 40px;">
-            <h3 style="margin-bottom: 20px; color: var(--secondary);">
-                <i class="fas fa-star"></i> Features
-            </h3>
-            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px;">
-                <div style="background: rgba(255,255,255,0.08); padding: 20px; border-radius: 12px;">
-                    <h4><i class="fas fa-paper-plane"></i> Send Messages</h4>
-                    <p style="color: var(--light); margin-top: 10px;">Send messages to any channel in any server where the bot is present.</p>
+
+        <div class="main-content">
+            <h2 class="form-title"><i class="fas fa-star"></i> Premium Features</h2>
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon"><i class="fas fa-upload"></i></div>
+                    <h3>File Upload</h3>
+                    <p>Support for images, documents, audio, video, and archives</p>
                 </div>
-                <div style="background: rgba(255,255,255,0.08); padding: 20px; border-radius: 12px;">
-                    <h4><i class="fas fa-edit"></i> Edit Messages</h4>
-                    <p style="color: var(--light); margin-top: 10px;">Edit existing messages sent by the bot.</p>
+                <div class="stat-card">
+                    <div class="stat-icon"><i class="fas fa-clock"></i></div>
+                    <h3>Scheduling</h3>
+                    <p>Schedule messages for future delivery</p>
                 </div>
-                <div style="background: rgba(255,255,255,0.08); padding: 20px; border-radius: 12px;">
-                    <h4><i class="fas fa-image"></i> Embed Support</h4>
-                    <p style="color: var(--light); margin-top: 10px;">Create beautiful embeds with colors, images, and fields.</p>
+                <div class="stat-card">
+                    <div class="stat-icon"><i class="fas fa-paint-brush"></i></div>
+                    <h3>Embed Builder</h3>
+                    <p>Create beautiful embeds with colors, fields, and images</p>
                 </div>
-                <div style="background: rgba(255,255,255,0.08); padding: 20px; border-radius: 12px;">
-                    <h4><i class="fas fa-smile"></i> Emoji Picker</h4>
-                    <p style="color: var(--light); margin-top: 10px;">Access all emojis from all servers the bot is in.</p>
+                <div class="stat-card">
+                    <div class="stat-icon"><i class="fas fa-copy"></i></div>
+                    <h3>Templates</h3>
+                    <p>Save and reuse message templates</p>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon"><i class="fas fa-chart-bar"></i></div>
+                    <h3>Analytics</h3>
+                    <p>Track message statistics and performance</p>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon"><i class="fas fa-bolt"></i></div>
+                    <h3>Bulk Send</h3>
+                    <p>Send messages to multiple channels at once</p>
                 </div>
             </div>
         </div>
@@ -795,213 +973,1290 @@ HTML_TEMPLATE = '''
         {% else %}
         <!-- Dashboard -->
         <div class="header">
-            <h1 class="title">Welcome, {{ user.username }}!</h1>
-            <p class="subtitle">Select a server and channel to start sending messages</p>
-            <div style="margin-top: 20px;">
-                <a href="/logout" style="color: var(--danger); text-decoration: none;">
-                    <i class="fas fa-sign-out-alt"></i> Logout
-                </a>
+            <div class="d-flex justify-between align-center">
+                <div>
+                    <h1 class="title">Welcome, {{ user.username }}!</h1>
+                    <p class="subtitle">Manage your Discord messages with advanced features</p>
+                </div>
+                <div class="d-flex gap-2 align-center">
+                    <div class="theme-toggle" onclick="toggleTheme()">
+                        <i class="fas fa-sun"></i>
+                        <i class="fas fa-moon"></i>
+                    </div>
+                    <a href="/logout" class="btn btn-danger">
+                        <i class="fas fa-sign-out-alt"></i> Logout
+                    </a>
+                </div>
             </div>
         </div>
-        
+
         <div class="dashboard">
-            <!-- Sidebar: Servers -->
+            <!-- Left Sidebar -->
             <div class="sidebar">
                 <div class="sidebar-title">
                     <i class="fas fa-server"></i> Your Servers
-                    <span style="margin-left: auto; font-size: 0.9rem; color: var(--secondary);" id="guildCount">0</span>
+                    <span id="guildCount" class="text-success">0</span>
                 </div>
                 
                 <div class="guild-list" id="guildList">
                     <div class="text-center p-3">
                         <div class="loading"></div>
-                        <p style="margin-top: 15px; color: var(--light);">Loading servers...</p>
+                        <p class="mt-3">Loading servers...</p>
+                    </div>
+                </div>
+                
+                <div class="mt-3">
+                    <div class="sidebar-title">
+                        <i class="fas fa-bolt"></i> Quick Stats
+                    </div>
+                    <div class="form-section">
+                        <div class="d-flex justify-between mb-2">
+                            <span>Messages Sent:</span>
+                            <strong id="totalMessages">0</strong>
+                        </div>
+                        <div class="d-flex justify-between mb-2">
+                            <span>Files Uploaded:</span>
+                            <strong id="totalFiles">0</strong>
+                        </div>
+                        <div class="d-flex justify-between mb-2">
+                            <span>Templates:</span>
+                            <strong id="totalTemplates">0</strong>
+                        </div>
+                        <div class="d-flex justify-between">
+                            <span>Scheduled:</span>
+                            <strong id="totalScheduled">0</strong>
+                        </div>
                     </div>
                 </div>
             </div>
-            
+
             <!-- Main Content -->
             <div class="main-content">
-                <!-- Status Bar -->
-                <div class="status-bar">
-                    <div class="status-card">
-                        <div class="status-icon"><i class="fas fa-hashtag"></i></div>
-                        <div class="status-value" id="channelCount">0</div>
-                        <div class="status-label">Channels</div>
-                    </div>
-                    <div class="status-card">
-                        <div class="status-icon"><i class="fas fa-smile"></i></div>
-                        <div class="status-value" id="emojiCount">0</div>
-                        <div class="status-label">Emojis</div>
-                    </div>
-                    <div class="status-card">
-                        <div class="status-icon"><i class="fas fa-users"></i></div>
-                        <div class="status-value" id="memberCount">0</div>
-                        <div class="status-label">Members</div>
-                    </div>
-                    <div class="status-card">
-                        <div class="status-icon"><i class="fas fa-bolt"></i></div>
-                        <div class="status-value">{{ ping }}ms</div>
-                        <div class="status-label">Ping</div>
-                    </div>
+                <!-- Tabs -->
+                <div class="tabs">
+                    <button class="tab-btn active" onclick="switchTab('compose')">
+                        <i class="fas fa-edit"></i> Compose
+                    </button>
+                    <button class="tab-btn" onclick="switchTab('files')">
+                        <i class="fas fa-upload"></i> Files
+                    </button>
+                    <button class="tab-btn" onclick="switchTab('templates')">
+                        <i class="fas fa-copy"></i> Templates
+                    </button>
+                    <button class="tab-btn" onclick="switchTab('schedule')">
+                        <i class="fas fa-clock"></i> Schedule
+                    </button>
+                    <button class="tab-btn" onclick="switchTab('analytics')">
+                        <i class="fas fa-chart-bar"></i> Analytics
+                    </button>
+                    <button class="tab-btn" onclick="switchTab('history')">
+                        <i class="fas fa-history"></i> History
+                    </button>
                 </div>
-                
-                <!-- Selected Guild Info -->
-                <div class="selected-info hidden" id="selectedGuildInfo">
-                    <h3 id="selectedGuildName"></h3>
-                    <div style="display: flex; gap: 20px; margin-top: 10px; color: var(--light);">
-                        <span id="selectedGuildStats"></span>
-                    </div>
-                </div>
-                
-                <!-- Channel Selector -->
-                <div class="channel-selector hidden" id="channelSection">
-                    <h3 class="form-label">
-                        <i class="fas fa-hashtag"></i> Select Channel
-                    </h3>
-                    <div class="channel-grid" id="channelList">
-                        <!-- Channels will be loaded here -->
-                    </div>
-                </div>
-                
-                <!-- Message Form -->
-                <div class="message-form hidden" id="messageSection">
-                    <h3 class="form-label">
-                        <i class="fas fa-edit"></i> Compose Message
-                    </h3>
-                    
-                    <div class="form-group">
-                        <label class="form-label">
-                            <i class="fas fa-heading"></i> Message Title (Optional)
-                        </label>
-                        <input type="text" class="form-control" id="messageTitle" 
-                               placeholder="Enter a title for your message...">
-                    </div>
-                    
-                    <div class="form-group">
-                        <label class="form-label">
-                            <i class="fas fa-comment"></i> Message Content
-                        </label>
-                        <textarea class="form-control" id="messageContent" rows="6"
-                                  placeholder="Type your message here... You can use markdown formatting!"></textarea>
-                    </div>
-                    
-                    <!-- Emoji Picker -->
-                    <div class="emoji-section">
-                        <label class="form-label">
-                            <i class="fas fa-smile"></i> Emoji Picker
-                        </label>
-                        <div class="emoji-grid" id="emojiPicker">
-                            <!-- Emojis will be loaded here -->
+
+                <!-- Tab Contents -->
+                <div id="tabContents">
+                    <!-- Compose Tab -->
+                    <div id="composeTab" class="tab-content">
+                        <!-- Server/Channel Selector -->
+                        <div class="form-section">
+                            <h3 class="form-title"><i class="fas fa-hashtag"></i> Select Destination</h3>
+                            <div class="form-group">
+                                <label class="form-label">Server</label>
+                                <select class="form-control" id="guildSelect" onchange="loadChannels()">
+                                    <option value="">Select a server</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Channel</label>
+                                <select class="form-control" id="channelSelect">
+                                    <option value="">Select a channel</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">
+                                    <i class="fas fa-bullhorn"></i> Bulk Send
+                                    <input type="checkbox" id="bulkSend" onchange="toggleBulkSend()">
+                                </label>
+                                <div id="bulkChannels" class="hidden">
+                                    <label class="form-label">Select Multiple Channels</label>
+                                    <div id="channelCheckboxes" class="file-list"></div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Message Form -->
+                        <div class="form-section">
+                            <h3 class="form-title"><i class="fas fa-edit"></i> Compose Message</h3>
+                            
+                            <div class="form-group">
+                                <label class="form-label">Title</label>
+                                <input type="text" class="form-control" id="messageTitle" placeholder="Message title...">
+                            </div>
+                            
+                            <div class="form-group">
+                                <label class="form-label">Content</label>
+                                <textarea class="form-control" id="messageContent" rows="6" 
+                                          placeholder="Type your message here..."></textarea>
+                            </div>
+
+                            <!-- Embed Builder -->
+                            <div class="form-group">
+                                <label class="form-label">
+                                    <i class="fas fa-paint-brush"></i> Embed Options
+                                    <input type="checkbox" id="useEmbed" onchange="toggleEmbedBuilder()">
+                                </label>
+                                
+                                <div id="embedBuilder" class="hidden">
+                                    <div class="embed-builder">
+                                        <div class="form-group">
+                                            <label class="form-label">Embed Color</label>
+                                            <div class="embed-color-picker">
+                                                <div class="color-option" style="background:#5865F2;" onclick="setEmbedColor('#5865F2')"></div>
+                                                <div class="color-option" style="background:#57F287;" onclick="setEmbedColor('#57F287')"></div>
+                                                <div class="color-option" style="background:#FEE75C;" onclick="setEmbedColor('#FEE75C')"></div>
+                                                <div class="color-option" style="background:#EB459E;" onclick="setEmbedColor('#EB459E')"></div>
+                                                <div class="color-option" style="background:#ED4245;" onclick="setEmbedColor('#ED4245')"></div>
+                                                <div class="color-option" style="background:#FFFFFF;" onclick="setEmbedColor('#FFFFFF')"></div>
+                                            </div>
+                                            <input type="color" class="form-control mt-2" id="customColor" onchange="setEmbedColor(this.value)">
+                                        </div>
+                                        
+                                        <div class="form-group">
+                                            <label class="form-label">Embed Image URL</label>
+                                            <input type="text" class="form-control" id="embedImage" placeholder="https://example.com/image.jpg">
+                                        </div>
+                                        
+                                        <div class="form-group">
+                                            <label class="form-label">Embed Thumbnail URL</label>
+                                            <input type="text" class="form-control" id="embedThumbnail" placeholder="https://example.com/thumbnail.jpg">
+                                        </div>
+                                    </div>
+                                    
+                                    <div class="embed-preview" id="embedPreview">
+                                        <div style="color: #5865F2; font-weight: bold; margin-bottom: 10px;" id="previewTitle"></div>
+                                        <div style="color: #b5bac1;" id="previewContent"></div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- File Upload -->
+                            <div class="form-group">
+                                <label class="form-label"><i class="fas fa-paperclip"></i> Attachments</label>
+                                <div class="file-upload" onclick="document.getElementById('fileInput').click()">
+                                    <div class="upload-icon">
+                                        <i class="fas fa-cloud-upload-alt"></i>
+                                    </div>
+                                    <h4>Click to upload files</h4>
+                                    <p>Supports images, documents, audio, video, and archives (Max 50MB)</p>
+                                    <input type="file" id="fileInput" multiple onchange="handleFileUpload(event)">
+                                </div>
+                                <div class="file-list" id="fileList"></div>
+                            </div>
+
+                            <!-- Preview -->
+                            <div class="form-section">
+                                <h3 class="form-title"><i class="fas fa-eye"></i> Preview</h3>
+                                <div id="messagePreview" class="embed-preview">
+                                    Preview will appear here...
+                                </div>
+                            </div>
+
+                            <!-- Action Buttons -->
+                            <div class="btn-group">
+                                <button class="btn btn-primary" onclick="sendMessage()">
+                                    <i class="fas fa-paper-plane"></i> Send Message
+                                </button>
+                                <button class="btn btn-success" onclick="saveTemplate()">
+                                    <i class="fas fa-save"></i> Save Template
+                                </button>
+                                <button class="btn btn-warning" onclick="scheduleMessage()">
+                                    <i class="fas fa-clock"></i> Schedule
+                                </button>
+                                <button class="btn btn-danger" onclick="clearForm()">
+                                    <i class="fas fa-trash"></i> Clear
+                                </button>
+                            </div>
                         </div>
                     </div>
-                    
-                    <!-- Preview -->
-                    <div class="preview-section">
-                        <div class="preview-title">
-                            <i class="fas fa-eye"></i> Live Preview
+
+                    <!-- Files Tab -->
+                    <div id="filesTab" class="tab-content hidden">
+                        <div class="form-section">
+                            <h3 class="form-title"><i class="fas fa-upload"></i> File Manager</h3>
+                            <div class="btn-group">
+                                <button class="btn btn-primary" onclick="uploadNewFile()">
+                                    <i class="fas fa-plus"></i> Upload New
+                                </button>
+                                <button class="btn btn-danger" onclick="clearAllFiles()">
+                                    <i class="fas fa-trash"></i> Clear All
+                                </button>
+                            </div>
+                            <div class="file-list mt-3" id="uploadedFiles"></div>
                         </div>
-                        <div class="preview-content" id="messagePreview">
-                            Preview will appear here...
+                    </div>
+
+                    <!-- Templates Tab -->
+                    <div id="templatesTab" class="tab-content hidden">
+                        <div class="form-section">
+                            <h3 class="form-title"><i class="fas fa-copy"></i> Message Templates</h3>
+                            <div class="btn-group">
+                                <button class="btn btn-primary" onclick="createNewTemplate()">
+                                    <i class="fas fa-plus"></i> New Template
+                                </button>
+                            </div>
+                            <div class="mt-3" id="templatesList"></div>
                         </div>
                     </div>
-                    
-                    <!-- Action Buttons -->
-                    <div class="button-group">
-                        <button class="btn btn-primary" onclick="sendMessage(false)">
-                            <i class="fas fa-paper-plane"></i> Send Message
-                        </button>
-                        <button class="btn btn-success" onclick="sendMessage(true)">
-                            <i class="fas fa-paint-brush"></i> Send as Embed
-                        </button>
-                        <button class="btn btn-secondary" onclick="clearForm()">
-                            <i class="fas fa-trash"></i> Clear Form
-                        </button>
-                        <button class="btn btn-secondary" onclick="updatePreview()">
-                            <i class="fas fa-sync"></i> Update Preview
-                        </button>
+
+                    <!-- Schedule Tab -->
+                    <div id="scheduleTab" class="tab-content hidden">
+                        <div class="form-section">
+                            <h3 class="form-title"><i class="fas fa-clock"></i> Scheduled Messages</h3>
+                            <div id="scheduledList"></div>
+                        </div>
                     </div>
-                </div>
-                
-                <!-- Message Logs -->
-                <div class="message-logs">
-                    <div class="logs-header">
-                        <h3 class="form-label">
-                            <i class="fas fa-history"></i> Recent Messages
-                        </h3>
-                        <button class="btn btn-secondary" onclick="refreshLogs()">
-                            <i class="fas fa-sync"></i> Refresh
-                        </button>
+
+                    <!-- Analytics Tab -->
+                    <div id="analyticsTab" class="tab-content hidden">
+                        <div class="form-section">
+                            <h3 class="form-title"><i class="fas fa-chart-bar"></i> Analytics Dashboard</h3>
+                            <div class="stats-grid">
+                                <div class="stat-card">
+                                    <div class="stat-icon"><i class="fas fa-paper-plane"></i></div>
+                                    <div class="stat-value" id="analyticsTotal">0</div>
+                                    <div class="stat-label">Total Messages</div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-icon"><i class="fas fa-image"></i></div>
+                                    <div class="stat-value" id="analyticsFiles">0</div>
+                                    <div class="stat-label">Files Sent</div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-icon"><i class="fas fa-paint-brush"></i></div>
+                                    <div class="stat-value" id="analyticsEmbeds">0</div>
+                                    <div class="stat-label">Embeds Sent</div>
+                                </div>
+                                <div class="stat-card">
+                                    <div class="stat-icon"><i class="fas fa-chart-line"></i></div>
+                                    <div class="stat-value" id="analyticsSuccess">100%</div>
+                                    <div class="stat-label">Success Rate</div>
+                                </div>
+                            </div>
+                            <div id="analyticsChart" class="mt-3">
+                                <canvas id="messageChart" width="400" height="200"></canvas>
+                            </div>
+                        </div>
                     </div>
-                    <div class="logs-container" id="messageLogs">
-                        <!-- Logs will be loaded here -->
+
+                    <!-- History Tab -->
+                    <div id="historyTab" class="tab-content hidden">
+                        <div class="form-section">
+                            <h3 class="form-title"><i class="fas fa-history"></i> Message History</h3>
+                            <div class="btn-group">
+                                <button class="btn btn-primary" onclick="refreshHistory()">
+                                    <i class="fas fa-sync"></i> Refresh
+                                </button>
+                                <button class="btn btn-danger" onclick="clearHistory()">
+                                    <i class="fas fa-trash"></i> Clear History
+                                </button>
+                            </div>
+                            <table class="data-table mt-3">
+                                <thead>
+                                    <tr>
+                                        <th>Time</th>
+                                        <th>Server</th>
+                                        <th>Type</th>
+                                        <th>Content</th>
+                                        <th>Status</th>
+                                        <th>Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="historyTable">
+                                    <!-- History rows will be inserted here -->
+                                </tbody>
+                            </table>
+                        </div>
                     </div>
                 </div>
             </div>
-        </div>
-        
-        <!-- Footer -->
-        <div class="footer">
-            <div class="footer-links">
-                <a href="/api/stats" class="footer-link" target="_blank">
-                    <i class="fas fa-chart-bar"></i> Statistics
-                </a>
-                <a href="/health" class="footer-link" target="_blank">
-                    <i class="fas fa-heartbeat"></i> Health
-                </a>
-                <a href="https://discord.com" class="footer-link" target="_blank">
-                    <i class="fab fa-discord"></i> Discord
-                </a>
+
+            <!-- Right Sidebar -->
+            <div class="right-sidebar">
+                <div class="sidebar-title">
+                    <i class="fas fa-bolt"></i> Quick Actions
+                </div>
+                
+                <div class="form-section">
+                    <button class="btn btn-primary w-100 mb-2" onclick="quickSend('announcement')">
+                        <i class="fas fa-bullhorn"></i> Announcement
+                    </button>
+                    <button class="btn btn-success w-100 mb-2" onclick="quickSend('welcome')">
+                        <i class="fas fa-door-open"></i> Welcome Message
+                    </button>
+                    <button class="btn btn-warning w-100 mb-2" onclick="quickSend('poll')">
+                        <i class="fas fa-poll"></i> Create Poll
+                    </button>
+                    <button class="btn btn-danger w-100 mb-2" onclick="quickSend('alert')">
+                        <i class="fas fa-exclamation-triangle"></i> Alert
+                    </button>
+                </div>
+
+                <div class="sidebar-title mt-3">
+                    <i class="fas fa-history"></i> Recent Activity
+                </div>
+                <div id="recentActivity"></div>
             </div>
-            <p style="color: var(--light); margin-top: 20px;">
-                🤖 Discord Message Dashboard v2.0 | Powered by Discord.py & Flask
-            </p>
-            <p class="update-time" style="color: var(--light); font-size: 0.9rem; margin-top: 10px;">
-                Last Updated: <span id="currentTime">{{ current_time }}</span>
-            </p>
         </div>
         {% endif %}
     </div>
-    
+
+    <!-- Modals -->
+    <div id="templateModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2><i class="fas fa-copy"></i> Save Template</h2>
+                <button class="modal-close" onclick="closeModal('templateModal')">&times;</button>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Template Name</label>
+                <input type="text" class="form-control" id="templateName" placeholder="Enter template name...">
+            </div>
+            <div class="btn-group">
+                <button class="btn btn-success" onclick="confirmSaveTemplate()">Save</button>
+                <button class="btn btn-danger" onclick="closeModal('templateModal')">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="scheduleModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2><i class="fas fa-clock"></i> Schedule Message</h2>
+                <button class="modal-close" onclick="closeModal('scheduleModal')">&times;</button>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Schedule Date & Time</label>
+                <input type="datetime-local" class="form-control" id="scheduleDateTime">
+            </div>
+            <div class="btn-group">
+                <button class="btn btn-success" onclick="confirmSchedule()">Schedule</button>
+                <button class="btn btn-danger" onclick="closeModal('scheduleModal')">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="uploadModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2><i class="fas fa-upload"></i> Upload Files</h2>
+                <button class="modal-close" onclick="closeModal('uploadModal')">&times;</button>
+            </div>
+            <div class="file-upload" onclick="document.getElementById('modalFileInput').click()">
+                <div class="upload-icon">
+                    <i class="fas fa-cloud-upload-alt"></i>
+                </div>
+                <h4>Drop files here or click to upload</h4>
+                <p>Maximum 50MB per file</p>
+                <input type="file" id="modalFileInput" multiple onchange="handleModalUpload(event)">
+            </div>
+            <div class="file-list mt-3" id="modalFileList"></div>
+            <div class="btn-group mt-3">
+                <button class="btn btn-success" onclick="confirmUpload()">Upload</button>
+                <button class="btn btn-danger" onclick="closeModal('uploadModal')">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toastContainer"></div>
+
     <script>
-        // Global variables
+        // Global Variables
+        let selectedFiles = [];
         let selectedGuild = null;
-        let selectedChannel = null;
-        let currentEmojis = [];
-        
+        let selectedChannels = [];
+        let currentTab = 'compose';
+        let embedColor = '#5865F2';
+        let currentTemplates = [];
+        let uploadedFilesList = [];
+        let scheduledMessages = [];
+
         // Initialize
         document.addEventListener('DOMContentLoaded', function() {
             {% if user %}
-            loadGuilds();
-            loadMessageLogs();
-            updateCurrentTime();
-            
-            // Auto-update time every minute
-            setInterval(updateCurrentTime, 60000);
-            
-            // Auto-refresh data every 30 seconds
-            setInterval(refreshData, 30000);
+            initializeDashboard();
             {% else %}
-            // Update stats for login page
             updatePublicStats();
             {% endif %}
+            
+            // Set theme
+            const theme = localStorage.getItem('theme') || 'dark';
+            document.documentElement.setAttribute('data-theme', theme);
+            
+            // Update time every minute
+            setInterval(updateTime, 60000);
+            updateTime();
         });
-        
-        // Update current time
-        function updateCurrentTime() {
-            const now = new Date();
-            document.getElementById('currentTime').textContent = 
-                now.toLocaleString('en-US', { 
-                    year: 'numeric', 
-                    month: 'short', 
-                    day: 'numeric',
-                    hour: '2-digit',
-                    minute: '2-digit',
-                    second: '2-digit'
-                }) + ' UTC';
+
+        // Theme Toggle
+        function toggleTheme() {
+            const currentTheme = document.documentElement.getAttribute('data-theme');
+            const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+            document.documentElement.setAttribute('data-theme', newTheme);
+            localStorage.setItem('theme', newTheme);
         }
-        
-        // Update public stats
+
+        // Tab Switching
+        function switchTab(tabName) {
+            // Update tab buttons
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            event.currentTarget.classList.add('active');
+            
+            // Hide all tabs
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.add('hidden');
+            });
+            
+            // Show selected tab
+            document.getElementById(tabName + 'Tab').classList.remove('hidden');
+            currentTab = tabName;
+            
+            // Load tab data
+            switch(tabName) {
+                case 'files':
+                    loadUploadedFiles();
+                    break;
+                case 'templates':
+                    loadTemplates();
+                    break;
+                case 'schedule':
+                    loadScheduledMessages();
+                    break;
+                case 'analytics':
+                    loadAnalytics();
+                    break;
+                case 'history':
+                    loadHistory();
+                    break;
+            }
+        }
+
+        // Initialize Dashboard
+        async function initializeDashboard() {
+            await loadGuilds();
+            await loadStats();
+            await loadRecentActivity();
+            updatePreview();
+            
+            // Load Chart.js if needed
+            if (typeof Chart !== 'undefined') {
+                initializeChart();
+            }
+        }
+
+        // Load Guilds
+        async function loadGuilds() {
+            try {
+                const response = await fetch('/api/guilds');
+                const data = await response.json();
+                
+                const guildSelect = document.getElementById('guildSelect');
+                const guildList = document.getElementById('guildList');
+                const guildCount = document.getElementById('guildCount');
+                
+                guildSelect.innerHTML = '<option value="">Select a server</option>';
+                guildList.innerHTML = '';
+                
+                if (data.guilds && data.guilds.length > 0) {
+                    guildCount.textContent = data.guilds.length;
+                    
+                    data.guilds.forEach(guild => {
+                        // Add to select dropdown
+                        const option = document.createElement('option');
+                        option.value = guild.id;
+                        option.textContent = guild.name;
+                        guildSelect.appendChild(option);
+                        
+                        // Add to guild list
+                        const guildItem = document.createElement('div');
+                        guildItem.className = 'file-item';
+                        guildItem.innerHTML = `
+                            <i class="fas fa-server"></i>
+                            <span>${guild.name}</span>
+                            <span style="margin-left: auto; font-size: 0.8em; color: var(--light);">
+                                ${guild.member_count} members
+                            </span>
+                        `;
+                        guildItem.onclick = () => {
+                            guildSelect.value = guild.id;
+                            loadChannels();
+                        };
+                        guildList.appendChild(guildItem);
+                    });
+                }
+            } catch (error) {
+                console.error('Error loading guilds:', error);
+                showToast('Error loading servers', 'danger');
+            }
+        }
+
+        // Load Channels
+        async function loadChannels() {
+            const guildId = document.getElementById('guildSelect').value;
+            if (!guildId) return;
+            
+            try {
+                const response = await fetch(`/api/channels?guild_id=${guildId}`);
+                const data = await response.json();
+                
+                const channelSelect = document.getElementById('channelSelect');
+                const channelCheckboxes = document.getElementById('channelCheckboxes');
+                
+                channelSelect.innerHTML = '<option value="">Select a channel</option>';
+                channelCheckboxes.innerHTML = '';
+                
+                if (data.channels && data.channels.length > 0) {
+                    data.channels.forEach(channel => {
+                        // Add to select dropdown
+                        const option = document.createElement('option');
+                        option.value = channel.id;
+                        option.textContent = `#${channel.name}`;
+                        channelSelect.appendChild(option);
+                        
+                        // Add to checkboxes for bulk send
+                        const checkbox = document.createElement('div');
+                        checkbox.className = 'file-item';
+                        checkbox.innerHTML = `
+                            <input type="checkbox" value="${channel.id}" id="ch_${channel.id}" 
+                                   onchange="updateSelectedChannels(this)">
+                            <label for="ch_${channel.id}">#${channel.name}</label>
+                        `;
+                        channelCheckboxes.appendChild(checkbox);
+                    });
+                }
+            } catch (error) {
+                console.error('Error loading channels:', error);
+            }
+        }
+
+        // Toggle Bulk Send
+        function toggleBulkSend() {
+            const bulkSend = document.getElementById('bulkSend').checked;
+            const bulkChannels = document.getElementById('bulkChannels');
+            const channelSelect = document.getElementById('channelSelect');
+            
+            if (bulkSend) {
+                bulkChannels.classList.remove('hidden');
+                channelSelect.disabled = true;
+                channelSelect.value = '';
+            } else {
+                bulkChannels.classList.add('hidden');
+                channelSelect.disabled = false;
+                selectedChannels = [];
+            }
+        }
+
+        // Update Selected Channels
+        function updateSelectedChannels(checkbox) {
+            if (checkbox.checked) {
+                selectedChannels.push(checkbox.value);
+            } else {
+                selectedChannels = selectedChannels.filter(id => id !== checkbox.value);
+            }
+        }
+
+        // Handle File Upload
+        function handleFileUpload(event) {
+            const files = Array.from(event.target.files);
+            const fileList = document.getElementById('fileList');
+            
+            files.forEach(file => {
+                if (file.size > 50 * 1024 * 1024) {
+                    showToast(`File ${file.name} exceeds 50MB limit`, 'danger');
+                    return;
+                }
+                
+                selectedFiles.push(file);
+                
+                const fileItem = document.createElement('div');
+                fileItem.className = 'file-item';
+                fileItem.innerHTML = `
+                    <i class="fas fa-file"></i>
+                    <span>${file.name} (${formatBytes(file.size)})</span>
+                    <span class="file-remove" onclick="removeFile('${file.name}')">
+                        <i class="fas fa-times"></i>
+                    </span>
+                `;
+                fileList.appendChild(fileItem);
+            });
+            
+            event.target.value = '';
+            showToast(`${files.length} file(s) added`, 'success');
+        }
+
+        // Remove File
+        function removeFile(fileName) {
+            selectedFiles = selectedFiles.filter(file => file.name !== fileName);
+            loadFileList();
+        }
+
+        // Load File List
+        function loadFileList() {
+            const fileList = document.getElementById('fileList');
+            fileList.innerHTML = '';
+            
+            selectedFiles.forEach(file => {
+                const fileItem = document.createElement('div');
+                fileItem.className = 'file-item';
+                fileItem.innerHTML = `
+                    <i class="fas fa-file"></i>
+                    <span>${file.name} (${formatBytes(file.size)})</span>
+                    <span class="file-remove" onclick="removeFile('${file.name}')">
+                        <i class="fas fa-times"></i>
+                    </span>
+                `;
+                fileList.appendChild(fileItem);
+            });
+        }
+
+        // Toggle Embed Builder
+        function toggleEmbedBuilder() {
+            const useEmbed = document.getElementById('useEmbed').checked;
+            const embedBuilder = document.getElementById('embedBuilder');
+            
+            if (useEmbed) {
+                embedBuilder.classList.remove('hidden');
+                updatePreview();
+            } else {
+                embedBuilder.classList.add('hidden');
+                updatePreview();
+            }
+        }
+
+        // Set Embed Color
+        function setEmbedColor(color) {
+            embedColor = color;
+            document.getElementById('customColor').value = color;
+            updatePreview();
+        }
+
+        // Update Preview
+        function updatePreview() {
+            const title = document.getElementById('messageTitle').value;
+            const content = document.getElementById('messageContent').value;
+            const useEmbed = document.getElementById('useEmbed').checked;
+            const preview = document.getElementById('messagePreview');
+            
+            let previewHTML = '';
+            
+            if (useEmbed) {
+                previewHTML = `
+                    <div style="border-left: 4px solid ${embedColor}; padding-left: 15px;">
+                        ${title ? `<div style="color: ${embedColor}; font-weight: bold; margin-bottom: 10px;">${title}</div>` : ''}
+                        <div style="color: #b5bac1;">${content || 'No content'}</div>
+                        ${selectedFiles.length > 0 ? `<div style="margin-top: 10px; color: var(--light);"><i class="fas fa-paperclip"></i> ${selectedFiles.length} attachment(s)</div>` : ''}
+                    </div>
+                `;
+            } else {
+                previewHTML = `
+                    ${title ? `<strong>${title}</strong><br><br>` : ''}
+                    ${content || '<em style="color: var(--light);">No content entered yet...</em>'}
+                    ${selectedFiles.length > 0 ? `<br><br><i class="fas fa-paperclip"></i> ${selectedFiles.length} attachment(s)` : ''}
+                `;
+            }
+            
+            preview.innerHTML = previewHTML;
+        }
+
+        // Send Message
+        async function sendMessage() {
+            const guildId = document.getElementById('guildSelect').value;
+            const channelId = document.getElementById('channelSelect').value;
+            const bulkSend = document.getElementById('bulkSend').checked;
+            
+            if (!guildId) {
+                showToast('Please select a server', 'danger');
+                return;
+            }
+            
+            if (!bulkSend && !channelId) {
+                showToast('Please select a channel', 'danger');
+                return;
+            }
+            
+            if (bulkSend && selectedChannels.length === 0) {
+                showToast('Please select at least one channel for bulk send', 'danger');
+                return;
+            }
+            
+            const title = document.getElementById('messageTitle').value;
+            const content = document.getElementById('messageContent').value;
+            const useEmbed = document.getElementById('useEmbed').checked;
+            
+            if (!content.trim() && selectedFiles.length === 0) {
+                showToast('Please enter content or attach files', 'danger');
+                return;
+            }
+            
+            try {
+                const formData = new FormData();
+                formData.append('guild_id', guildId);
+                formData.append('title', title);
+                formData.append('content', content);
+                formData.append('embed', useEmbed);
+                formData.append('embed_color', embedColor);
+                formData.append('bulk_send', bulkSend);
+                
+                if (bulkSend) {
+                    formData.append('channel_ids', JSON.stringify(selectedChannels));
+                } else {
+                    formData.append('channel_id', channelId);
+                }
+                
+                // Add files
+                selectedFiles.forEach(file => {
+                    formData.append('files', file);
+                });
+                
+                // Add embed data if enabled
+                if (useEmbed) {
+                    formData.append('embed_image', document.getElementById('embedImage').value);
+                    formData.append('embed_thumbnail', document.getElementById('embedThumbnail').value);
+                }
+                
+                const response = await fetch('/api/send', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showToast(result.message || 'Message sent successfully!', 'success');
+                    clearForm();
+                    loadStats();
+                    loadRecentActivity();
+                } else {
+                    showToast('Error: ' + (result.error || 'Failed to send message'), 'danger');
+                }
+            } catch (error) {
+                showToast('Network error: ' + error.message, 'danger');
+            }
+        }
+
+        // Clear Form
+        function clearForm() {
+            document.getElementById('messageTitle').value = '';
+            document.getElementById('messageContent').value = '';
+            document.getElementById('embedImage').value = '';
+            document.getElementById('embedThumbnail').value = '';
+            document.getElementById('useEmbed').checked = false;
+            document.getElementById('bulkSend').checked = false;
+            
+            selectedFiles = [];
+            selectedChannels = [];
+            
+            loadFileList();
+            toggleEmbedBuilder();
+            toggleBulkSend();
+            updatePreview();
+        }
+
+        // Save Template
+        function saveTemplate() {
+            const content = document.getElementById('messageContent').value;
+            if (!content.trim()) {
+                showToast('Please enter content to save as template', 'warning');
+                return;
+            }
+            
+            openModal('templateModal');
+        }
+
+        // Confirm Save Template
+        async function confirmSaveTemplate() {
+            const name = document.getElementById('templateName').value;
+            if (!name.trim()) {
+                showToast('Please enter template name', 'warning');
+                return;
+            }
+            
+            const title = document.getElementById('messageTitle').value;
+            const content = document.getElementById('messageContent').value;
+            const useEmbed = document.getElementById('useEmbed').checked;
+            const embedColor = document.getElementById('customColor').value;
+            
+            try {
+                const response = await fetch('/api/templates', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        name: name,
+                        title: title,
+                        content: content,
+                        embed: useEmbed,
+                        embed_color: embedColor
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showToast('Template saved successfully!', 'success');
+                    closeModal('templateModal');
+                    loadTemplates();
+                } else {
+                    showToast('Error saving template: ' + result.error, 'danger');
+                }
+            } catch (error) {
+                showToast('Error: ' + error.message, 'danger');
+            }
+        }
+
+        // Schedule Message
+        function scheduleMessage() {
+            const content = document.getElementById('messageContent').value;
+            if (!content.trim() && selectedFiles.length === 0) {
+                showToast('Please enter content to schedule', 'warning');
+                return;
+            }
+            
+            openModal('scheduleModal');
+        }
+
+        // Confirm Schedule
+        async function confirmSchedule() {
+            const scheduleTime = document.getElementById('scheduleDateTime').value;
+            if (!scheduleTime) {
+                showToast('Please select schedule time', 'warning');
+                return;
+            }
+            
+            const guildId = document.getElementById('guildSelect').value;
+            const channelId = document.getElementById('channelSelect').value;
+            const title = document.getElementById('messageTitle').value;
+            const content = document.getElementById('messageContent').value;
+            const useEmbed = document.getElementById('useEmbed').checked;
+            
+            try {
+                const response = await fetch('/api/schedule', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        guild_id: guildId,
+                        channel_id: channelId,
+                        title: title,
+                        content: content,
+                        embed: useEmbed,
+                        embed_color: embedColor,
+                        scheduled_time: scheduleTime
+                    })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    showToast('Message scheduled successfully!', 'success');
+                    closeModal('scheduleModal');
+                    loadScheduledMessages();
+                } else {
+                    showToast('Error scheduling message: ' + result.error, 'danger');
+                }
+            } catch (error) {
+                showToast('Error: ' + error.message, 'danger');
+            }
+        }
+
+        // Load Stats
+        async function loadStats() {
+            try {
+                const response = await fetch('/api/stats');
+                const data = await response.json();
+                
+                document.getElementById('totalMessages').textContent = data.total_messages || 0;
+                document.getElementById('totalFiles').textContent = data.total_files || 0;
+                document.getElementById('totalTemplates').textContent = data.total_templates || 0;
+                document.getElementById('totalScheduled').textContent = data.total_scheduled || 0;
+            } catch (error) {
+                console.error('Error loading stats:', error);
+            }
+        }
+
+        // Load Uploaded Files
+        async function loadUploadedFiles() {
+            try {
+                const response = await fetch('/api/files');
+                const data = await response.json();
+                uploadedFilesList = data.files || [];
+                
+                const container = document.getElementById('uploadedFiles');
+                container.innerHTML = '';
+                
+                uploadedFilesList.forEach(file => {
+                    const fileItem = document.createElement('div');
+                    fileItem.className = 'file-item';
+                    fileItem.innerHTML = `
+                        <i class="fas fa-file"></i>
+                        <span>${file.filename} (${formatBytes(file.file_size)})</span>
+                        <span style="margin-left: auto; font-size: 0.8em; color: var(--light);">
+                            ${file.file_type}
+                        </span>
+                        <span class="file-remove" onclick="deleteFile('${file.id}')">
+                            <i class="fas fa-trash"></i>
+                        </span>
+                    `;
+                    container.appendChild(fileItem);
+                });
+            } catch (error) {
+                console.error('Error loading files:', error);
+            }
+        }
+
+        // Load Templates
+        async function loadTemplates() {
+            try {
+                const response = await fetch('/api/templates');
+                const data = await response.json();
+                currentTemplates = data.templates || [];
+                
+                const container = document.getElementById('templatesList');
+                container.innerHTML = '';
+                
+                currentTemplates.forEach(template => {
+                    const templateCard = document.createElement('div');
+                    templateCard.className = 'stat-card';
+                    templateCard.innerHTML = `
+                        <div class="d-flex justify-between align-center">
+                            <div>
+                                <h4>${template.name}</h4>
+                                <p style="color: var(--light); font-size: 0.9em; margin-top: 5px;">
+                                    ${template.content.substring(0, 100)}${template.content.length > 100 ? '...' : ''}
+                                </p>
+                            </div>
+                            <div class="d-flex gap-2">
+                                <button class="btn btn-primary btn-sm" onclick="useTemplate('${template.id}')">
+                                    <i class="fas fa-use"></i>
+                                </button>
+                                <button class="btn btn-danger btn-sm" onclick="deleteTemplate('${template.id}')">
+                                    <i class="fas fa-trash"></i>
+                                </button>
+                            </div>
+                        </div>
+                    `;
+                    container.appendChild(templateCard);
+                });
+            } catch (error) {
+                console.error('Error loading templates:', error);
+            }
+        }
+
+        // Load Scheduled Messages
+        async function loadScheduledMessages() {
+            try {
+                const response = await fetch('/api/scheduled');
+                const data = await response.json();
+                scheduledMessages = data.scheduled || [];
+                
+                const container = document.getElementById('scheduledList');
+                container.innerHTML = '';
+                
+                scheduledMessages.forEach(schedule => {
+                    const date = new Date(schedule.scheduled_time);
+                    const now = new Date();
+                    const timeLeft = date - now;
+                    
+                    const card = document.createElement('div');
+                    card.className = 'stat-card';
+                    card.innerHTML = `
+                        <div class="d-flex justify-between align-center">
+                            <div>
+                                <h4>${schedule.title || 'No Title'}</h4>
+                                <p style="color: var(--light); font-size: 0.9em; margin-top: 5px;">
+                                    Scheduled: ${date.toLocaleString()}
+                                </p>
+                                <p style="color: var(--light); font-size: 0.8em;">
+                                    ${schedule.content.substring(0, 80)}${schedule.content.length > 80 ? '...' : ''}
+                                </p>
+                            </div>
+                            <div class="d-flex gap-2">
+                                <span class="badge ${timeLeft > 0 ? 'badge-warning' : 'badge-success'}">
+                                    ${timeLeft > 0 ? formatTimeLeft(timeLeft) : 'Ready'}
+                                </span>
+                                <button class="btn btn-danger btn-sm" onclick="cancelSchedule('${schedule.id}')">
+                                    <i class="fas fa-times"></i>
+                                </button>
+                            </div>
+                        </div>
+                    `;
+                    container.appendChild(card);
+                });
+            } catch (error) {
+                console.error('Error loading scheduled messages:', error);
+            }
+        }
+
+        // Load Analytics
+        async function loadAnalytics() {
+            try {
+                const response = await fetch('/api/analytics');
+                const data = await response.json();
+                
+                document.getElementById('analyticsTotal').textContent = data.total_messages || 0;
+                document.getElementById('analyticsFiles').textContent = data.total_files || 0;
+                document.getElementById('analyticsEmbeds').textContent = data.total_embeds || 0;
+                document.getElementById('analyticsSuccess').textContent = data.success_rate || '100%';
+                
+                // Update chart if available
+                if (window.messageChart && data.daily_stats) {
+                    updateChart(data.daily_stats);
+                }
+            } catch (error) {
+                console.error('Error loading analytics:', error);
+            }
+        }
+
+        // Load History
+        async function loadHistory() {
+            try {
+                const response = await fetch('/api/history');
+                const data = await response.json();
+                
+                const table = document.getElementById('historyTable');
+                table.innerHTML = '';
+                
+                data.history.forEach(item => {
+                    const date = new Date(item.timestamp * 1000);
+                    const row = document.createElement('tr');
+                    row.innerHTML = `
+                        <td>${date.toLocaleString()}</td>
+                        <td>${item.guild}</td>
+                        <td><span class="badge ${item.type.includes('Embed') ? 'badge-success' : 'badge-primary'}">${item.type}</span></td>
+                        <td>${item.content}</td>
+                        <td><span class="badge badge-success">${item.status}</span></td>
+                        <td>
+                            <button class="btn btn-sm btn-primary" onclick="resendMessage('${item.id}')">
+                                <i class="fas fa-redo"></i>
+                            </button>
+                            <button class="btn btn-sm btn-danger" onclick="deleteMessage('${item.id}')">
+                                <i class="fas fa-trash"></i>
+                            </button>
+                        </td>
+                    `;
+                    table.appendChild(row);
+                });
+            } catch (error) {
+                console.error('Error loading history:', error);
+            }
+        }
+
+        // Load Recent Activity
+        async function loadRecentActivity() {
+            try {
+                const response = await fetch('/api/activity');
+                const data = await response.json();
+                
+                const container = document.getElementById('recentActivity');
+                container.innerHTML = '';
+                
+                data.activity.forEach(activity => {
+                    const activityItem = document.createElement('div');
+                    activityItem.className = 'file-item mb-2';
+                    activityItem.innerHTML = `
+                        <i class="fas fa-${activity.icon}"></i>
+                        <div>
+                            <div>${activity.message}</div>
+                            <small style="color: var(--light);">${activity.time}</small>
+                        </div>
+                    `;
+                    container.appendChild(activityItem);
+                });
+            } catch (error) {
+                console.error('Error loading activity:', error);
+            }
+        }
+
+        // Quick Send Templates
+        function quickSend(type) {
+            let title = '';
+            let content = '';
+            let embed = false;
+            
+            switch(type) {
+                case 'announcement':
+                    title = '📢 Important Announcement';
+                    content = 'Attention everyone! This is an important announcement.';
+                    embed = true;
+                    embedColor = '#ED4245';
+                    break;
+                case 'welcome':
+                    title = '👋 Welcome to the Server!';
+                    content = 'Hello and welcome to our server! Please read the rules and introduce yourself.';
+                    embed = true;
+                    embedColor = '#57F287';
+                    break;
+                case 'poll':
+                    title = '📊 Community Poll';
+                    content = 'What do you think about this?\n\n✅ Yes\n❌ No\n🤔 Maybe';
+                    embed = false;
+                    break;
+                case 'alert':
+                    title = '⚠️ Important Alert';
+                    content = 'Please read this important information immediately!';
+                    embed = true;
+                    embedColor = '#FEE75C';
+                    break;
+            }
+            
+            document.getElementById('messageTitle').value = title;
+            document.getElementById('messageContent').value = content;
+            document.getElementById('useEmbed').checked = embed;
+            
+            if (embed) {
+                setEmbedColor(embedColor);
+                toggleEmbedBuilder();
+            }
+            
+            updatePreview();
+            showToast(`Loaded ${type} template`, 'success');
+        }
+
+        // Modal Functions
+        function openModal(modalId) {
+            document.getElementById(modalId).classList.add('active');
+        }
+
+        function closeModal(modalId) {
+            document.getElementById(modalId).classList.remove('active');
+        }
+
+        // Utility Functions
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        function formatTimeLeft(ms) {
+            const days = Math.floor(ms / (1000 * 60 * 60 * 24));
+            const hours = Math.floor((ms % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+            const minutes = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60));
+            
+            if (days > 0) return `${days}d ${hours}h`;
+            if (hours > 0) return `${hours}h ${minutes}m`;
+            return `${minutes}m`;
+        }
+
+        function showToast(message, type = 'success') {
+            const container = document.getElementById('toastContainer');
+            const toast = document.createElement('div');
+            toast.className = 'toast';
+            
+            const icon = type === 'success' ? 'check-circle' : 
+                        type === 'danger' ? 'exclamation-circle' : 'info-circle';
+            
+            toast.innerHTML = `
+                <i class="fas fa-${icon}"></i>
+                <span>${message}</span>
+            `;
+            
+            container.appendChild(toast);
+            
+            setTimeout(() => {
+                toast.remove();
+            }, 3000);
+        }
+
+        function updateTime() {
+            const now = new Date();
+            document.querySelectorAll('.current-time').forEach(el => {
+                el.textContent = now.toLocaleTimeString();
+            });
+        }
+
+        // Event Listeners
+        document.getElementById('messageTitle').addEventListener('input', updatePreview);
+        document.getElementById('messageContent').addEventListener('input', updatePreview);
+        document.getElementById('embedImage').addEventListener('input', updatePreview);
+        document.getElementById('embedThumbnail').addEventListener('input', updatePreview);
+
+        // Keyboard Shortcuts
+        document.addEventListener('keydown', function(e) {
+            if (e.ctrlKey && e.key === 'Enter') {
+                e.preventDefault();
+                sendMessage();
+            }
+            if (e.ctrlKey && e.key === 's') {
+                e.preventDefault();
+                saveTemplate();
+            }
+            if (e.key === 'Escape') {
+                clearForm();
+            }
+        });
+
+        // Initialize Chart
+        function initializeChart() {
+            const ctx = document.getElementById('messageChart').getContext('2d');
+            window.messageChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: 'Messages Sent',
+                        data: [],
+                        borderColor: '#7289da',
+                        backgroundColor: 'rgba(114, 137, 218, 0.1)',
+                        fill: true
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        legend: {
+                            labels: {
+                                color: '#ffffff'
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            ticks: {
+                                color: '#ffffff'
+                            },
+                            grid: {
+                                color: 'rgba(255, 255, 255, 0.1)'
+                            }
+                        },
+                        y: {
+                            ticks: {
+                                color: '#ffffff'
+                            },
+                            grid: {
+                                color: 'rgba(255, 255, 255, 0.1)'
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function updateChart(dailyStats) {
+            if (!window.messageChart) return;
+            
+            const labels = Object.keys(dailyStats);
+            const data = Object.values(dailyStats).map(stat => stat.messages_sent || 0);
+            
+            window.messageChart.data.labels = labels;
+            window.messageChart.data.datasets[0].data = data;
+            window.messageChart.update();
+        }
+
+        // Public Stats (for login page)
         async function updatePublicStats() {
             try {
                 const response = await fetch('/api/public_stats');
@@ -1014,406 +2269,6 @@ HTML_TEMPLATE = '''
                 console.error('Error fetching public stats:', error);
             }
         }
-        
-        // Load guilds
-        async function loadGuilds() {
-            try {
-                const response = await fetch('/api/guilds');
-                const data = await response.json();
-                
-                const guildList = document.getElementById('guildList');
-                const guildCount = document.getElementById('guildCount');
-                
-                if (data.guilds && data.guilds.length > 0) {
-                    guildList.innerHTML = '';
-                    guildCount.textContent = data.guilds.length;
-                    
-                    data.guilds.forEach(guild => {
-                        const guildItem = document.createElement('div');
-                        guildItem.className = 'guild-item';
-                        guildItem.innerHTML = `
-                            <div class="guild-icon">
-                                ${guild.icon ? `<img src="${guild.icon}" alt="${guild.name}">` : '🤖'}
-                            </div>
-                            <div class="guild-info">
-                                <div class="guild-name">${guild.name}</div>
-                                <div class="guild-stats">
-                                    <span><i class="fas fa-hashtag"></i> ${guild.channel_count}</span>
-                                    <span><i class="fas fa-smile"></i> ${guild.emoji_count}</span>
-                                    <span><i class="fas fa-users"></i> ${guild.member_count}</span>
-                                </div>
-                            </div>
-                        `;
-                        
-                        guildItem.onclick = () => selectGuild(guild);
-                        guildList.appendChild(guildItem);
-                    });
-                } else {
-                    guildList.innerHTML = `
-                        <div class="text-center p-3">
-                            <i class="fas fa-exclamation-triangle" style="font-size: 3rem; color: var(--danger);"></i>
-                            <p style="margin-top: 15px; color: var(--light);">
-                                No mutual servers found. Make sure the bot is in your servers.
-                            </p>
-                        </div>
-                    `;
-                }
-                
-            } catch (error) {
-                console.error('Error loading guilds:', error);
-                showToast('Error loading servers', 'danger');
-            }
-        }
-        
-        // Select guild
-        async function selectGuild(guild) {
-            selectedGuild = guild;
-            selectedChannel = null;
-            
-            // Update UI
-            document.querySelectorAll('.guild-item').forEach(item => {
-                item.classList.remove('active');
-            });
-            event.currentTarget.classList.add('active');
-            
-            // Show selected guild info
-            const infoDiv = document.getElementById('selectedGuildInfo');
-            const nameSpan = document.getElementById('selectedGuildName');
-            const statsSpan = document.getElementById('selectedGuildStats');
-            
-            nameSpan.innerHTML = `<i class="fas fa-server"></i> ${guild.name}`;
-            statsSpan.innerHTML = `
-                <span><i class="fas fa-hashtag"></i> ${guild.channel_count} channels</span>
-                <span><i class="fas fa-smile"></i> ${guild.emoji_count} emojis</span>
-                <span><i class="fas fa-users"></i> ${guild.member_count} members</span>
-            `;
-            infoDiv.classList.remove('hidden');
-            
-            // Load channels
-            await loadChannels(guild.id);
-            
-            // Load emojis
-            await loadEmojis(guild.id);
-            
-            // Update stats
-            document.getElementById('channelCount').textContent = guild.channel_count;
-            document.getElementById('emojiCount').textContent = guild.emoji_count;
-            document.getElementById('memberCount').textContent = guild.member_count;
-        }
-        
-        // Load channels
-        async function loadChannels(guildId) {
-            try {
-                const response = await fetch(`/api/channels?guild_id=${guildId}`);
-                const data = await response.json();
-                
-                const channelSection = document.getElementById('channelSection');
-                const channelList = document.getElementById('channelList');
-                
-                if (data.channels && data.channels.length > 0) {
-                    channelList.innerHTML = '';
-                    
-                    data.channels.forEach(channel => {
-                        const channelCard = document.createElement('div');
-                        channelCard.className = 'channel-card';
-                        channelCard.innerHTML = `
-                            <div class="channel-icon">
-                                <i class="fas fa-hashtag"></i>
-                            </div>
-                            <div>${channel.name}</div>
-                        `;
-                        
-                        channelCard.onclick = () => selectChannel(channel);
-                        channelList.appendChild(channelCard);
-                    });
-                    
-                    channelSection.classList.remove('hidden');
-                }
-                
-            } catch (error) {
-                console.error('Error loading channels:', error);
-            }
-        }
-        
-        // Load emojis
-        async function loadEmojis(guildId) {
-            try {
-                const response = await fetch(`/api/emojis?guild_id=${guildId}`);
-                const data = await response.json();
-                
-                currentEmojis = data.emojis || [];
-                updateEmojiPicker();
-                
-            } catch (error) {
-                console.error('Error loading emojis:', error);
-            }
-        }
-        
-        // Update emoji picker
-        function updateEmojiPicker() {
-            const emojiPicker = document.getElementById('emojiPicker');
-            emojiPicker.innerHTML = '';
-            
-            // Add default emojis
-            const defaultEmojis = ['😀', '😂', '❤️', '🔥', '👍', '🎉', '✨', '🌟', '🚀', '💯', '😎', '🤔', '😍', '🥳', '🙏'];
-            
-            defaultEmojis.forEach(emoji => {
-                addEmojiToPicker(emoji, emoji);
-            });
-            
-            // Add custom emojis
-            currentEmojis.forEach(emoji => {
-                addEmojiToPicker(emoji, emoji);
-            });
-        }
-        
-        function addEmojiToPicker(emoji, display) {
-            const emojiPicker = document.getElementById('emojiPicker');
-            const emojiItem = document.createElement('div');
-            emojiItem.className = 'emoji-item';
-            emojiItem.innerHTML = display;
-            emojiItem.title = emoji;
-            emojiItem.onclick = () => insertEmoji(emoji);
-            emojiPicker.appendChild(emojiItem);
-        }
-        
-        // Select channel
-        function selectChannel(channel) {
-            selectedChannel = channel;
-            
-            // Update UI
-            document.querySelectorAll('.channel-card').forEach(card => {
-                card.classList.remove('active');
-            });
-            event.currentTarget.classList.add('active');
-            
-            // Show message form
-            document.getElementById('messageSection').classList.remove('hidden');
-            
-            updatePreview();
-        }
-        
-        // Insert emoji
-        function insertEmoji(emoji) {
-            const textarea = document.getElementById('messageContent');
-            const start = textarea.selectionStart;
-            const end = textarea.selectionEnd;
-            const text = textarea.value;
-            
-            textarea.value = text.substring(0, start) + emoji + text.substring(end);
-            textarea.focus();
-            textarea.selectionStart = textarea.selectionEnd = start + emoji.length;
-            
-            updatePreview();
-        }
-        
-        // Update preview
-        function updatePreview() {
-            const title = document.getElementById('messageTitle').value;
-            const content = document.getElementById('messageContent').value;
-            const preview = document.getElementById('messagePreview');
-            
-            let previewHTML = '';
-            
-            if (title) {
-                previewHTML += `<strong style="color: var(--secondary);">${title}</strong><br><br>`;
-            }
-            
-            previewHTML += content || '<em style="color: var(--light);">No content entered yet...</em>';
-            
-            preview.innerHTML = previewHTML;
-        }
-        
-        // Send message
-        async function sendMessage(isEmbed) {
-            if (!selectedGuild || !selectedChannel) {
-                showToast('Please select a server and channel first!', 'danger');
-                return;
-            }
-            
-            const title = document.getElementById('messageTitle').value;
-            const content = document.getElementById('messageContent').value;
-            
-            if (!content.trim()) {
-                showToast('Please enter a message!', 'danger');
-                return;
-            }
-            
-            try {
-                const response = await fetch('/api/send', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        guild_id: selectedGuild.id,
-                        channel_id: selectedChannel.id,
-                        title: title,
-                        content: content,
-                        embed: isEmbed
-                    })
-                });
-                
-                const result = await response.json();
-                
-                if (result.success) {
-                    showToast(isEmbed ? '✅ Embed sent successfully!' : '✅ Message sent successfully!', 'success');
-                    addToMessageLog(title, content, selectedGuild.name, isEmbed);
-                    clearForm();
-                } else {
-                    showToast('❌ Error: ' + (result.error || 'Failed to send message'), 'danger');
-                }
-                
-            } catch (error) {
-                showToast('❌ Network error: ' + error.message, 'danger');
-            }
-        }
-        
-        // Add to message log
-        function addToMessageLog(title, content, guildName, isEmbed) {
-            const logs = document.getElementById('messageLogs');
-            const now = new Date();
-            const timeStr = now.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-            
-            const logItem = document.createElement('div');
-            logItem.className = 'log-item';
-            logItem.innerHTML = `
-                <div class="log-header">
-                    <div class="log-time">${timeStr} • ${guildName}</div>
-                    <div class="log-type">${isEmbed ? '🎨 Embed' : '📨 Message'}</div>
-                </div>
-                <div class="log-content">
-                    ${title ? `<strong>${title}</strong><br>` : ''}
-                    ${content.substring(0, 100)}${content.length > 100 ? '...' : ''}
-                </div>
-            `;
-            
-            logs.insertBefore(logItem, logs.firstChild);
-            
-            // Keep only last 20 logs
-            const items = logs.getElementsByClassName('log-item');
-            if (items.length > 20) {
-                logs.removeChild(items[items.length - 1]);
-            }
-        }
-        
-        // Load message logs
-        async function loadMessageLogs() {
-            try {
-                const response = await fetch('/api/logs');
-                const data = await response.json();
-                
-                const logs = document.getElementById('messageLogs');
-                logs.innerHTML = '';
-                
-                if (data.messages && data.messages.length > 0) {
-                    data.messages.forEach(msg => {
-                        const time = new Date(msg.timestamp * 1000);
-                        const timeStr = time.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-                        
-                        const logItem = document.createElement('div');
-                        logItem.className = 'log-item';
-                        logItem.innerHTML = `
-                            <div class="log-header">
-                                <div class="log-time">${timeStr} • ${msg.guild}</div>
-                                <div class="log-type">${msg.type}</div>
-                            </div>
-                            <div class="log-content">
-                                ${msg.title ? `<strong>${msg.title}</strong><br>` : ''}
-                                ${msg.content}
-                            </div>
-                        `;
-                        logs.appendChild(logItem);
-                    });
-                } else {
-                    logs.innerHTML = `
-                        <div class="text-center p-3">
-                            <i class="fas fa-comment-slash" style="font-size: 3rem; color: var(--light);"></i>
-                            <p style="margin-top: 15px; color: var(--light);">
-                                No messages sent yet. Send your first message!
-                            </p>
-                        </div>
-                    `;
-                }
-                
-            } catch (error) {
-                console.error('Error loading logs:', error);
-            }
-        }
-        
-        // Refresh logs
-        function refreshLogs() {
-            loadMessageLogs();
-            showToast('Logs refreshed!', 'success');
-        }
-        
-        // Refresh all data
-        function refreshData() {
-            if (selectedGuild) {
-                selectGuild(selectedGuild);
-            } else {
-                loadGuilds();
-            }
-            loadMessageLogs();
-        }
-        
-        // Clear form
-        function clearForm() {
-            document.getElementById('messageTitle').value = '';
-            document.getElementById('messageContent').value = '';
-            updatePreview();
-            showToast('Form cleared!', 'success');
-        }
-        
-        // Show toast notification
-        function showToast(message, type = 'success') {
-            // Remove existing toast
-            const existingToast = document.querySelector('.toast');
-            if (existingToast) existingToast.remove();
-            
-            // Create new toast
-            const toast = document.createElement('div');
-            toast.className = 'toast';
-            
-            const bgColor = type === 'success' ? 'var(--secondary)' : 
-                           type === 'danger' ? 'var(--danger)' : 'var(--primary)';
-            
-            toast.innerHTML = `
-                <style>
-                    .toast {
-                        background: ${bgColor};
-                    }
-                </style>
-                ${message}
-            `;
-            
-            document.body.appendChild(toast);
-            
-            // Auto-remove after 3 seconds
-            setTimeout(() => {
-                if (toast.parentNode) {
-                    toast.parentNode.removeChild(toast);
-                }
-            }, 3000);
-        }
-        
-        // Auto-update preview
-        document.getElementById('messageTitle').addEventListener('input', updatePreview);
-        document.getElementById('messageContent').addEventListener('input', updatePreview);
-        
-        // Keyboard shortcuts
-        document.addEventListener('keydown', function(e) {
-            // Ctrl+Enter to send message
-            if (e.ctrlKey && e.key === 'Enter') {
-                sendMessage(false);
-            }
-            // Ctrl+Shift+Enter to send embed
-            if (e.ctrlKey && e.shiftKey && e.key === 'Enter') {
-                sendMessage(true);
-            }
-            // Escape to clear form
-            if (e.key === 'Escape') {
-                clearForm();
-            }
-        });
     </script>
 </body>
 </html>
@@ -1425,7 +2280,6 @@ def index():
     user = session.get('user')
     current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')
     
-    # Calculate bot ping (placeholder)
     ping = 0
     try:
         ping = round(bot.latency * 1000)
@@ -1454,20 +2308,20 @@ def callback():
     if not code:
         return "No code provided", 400
     
-    # Exchange code for token
-    data = {
-        'client_id': DISCORD_CLIENT_ID,
-        'client_secret': DISCORD_CLIENT_SECRET,
-        'grant_type': 'authorization_code',
-        'code': code,
-        'redirect_uri': DISCORD_REDIRECT_URI,
-        'scope': 'identify guilds'
-    }
-    
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    
     try:
+        # Exchange code for token
+        data = {
+            'client_id': DISCORD_CLIENT_ID,
+            'client_secret': DISCORD_CLIENT_SECRET,
+            'grant_type': 'authorization_code',
+            'code': code,
+            'redirect_uri': DISCORD_REDIRECT_URI,
+            'scope': 'identify guilds'
+        }
+        
+        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
         r = requests.post('https://discord.com/api/oauth2/token', data=data, headers=headers)
+        
         if r.status_code != 200:
             return f"Token exchange failed: {r.text}", 400
         
@@ -1477,6 +2331,7 @@ def callback():
         # Get user info
         headers = {'Authorization': f'Bearer {access_token}'}
         r = requests.get('https://discord.com/api/users/@me', headers=headers)
+        
         if r.status_code != 200:
             return "Failed to get user info", 400
         
@@ -1491,12 +2346,15 @@ def callback():
         session['access_token'] = access_token
         session['user_guilds'] = [str(g['id']) for g in user_guilds]
         
-        # Store in bot data
-        user_sessions[str(user['id'])] = {
-            'user': user,
-            'access_token': access_token,
-            'guilds': [str(g['id']) for g in user_guilds]
-        }
+        # Store in database
+        conn = sqlite3.connect('dashboard.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO users (id, username, avatar, access_token)
+            VALUES (?, ?, ?, ?)
+        ''', (user['id'], user['username'], user.get('avatar'), access_token))
+        conn.commit()
+        conn.close()
         
         return redirect('/')
         
@@ -1511,9 +2369,10 @@ def logout():
     session.clear()
     return redirect('/')
 
+# ========== API ROUTES ==========
 @app.route('/api/guilds')
 def api_guilds():
-    """Get mutual guilds (where both user and bot are present)"""
+    """Get mutual guilds"""
     user_id = session.get('user', {}).get('id')
     if not user_id:
         return jsonify({'guilds': []})
@@ -1537,7 +2396,7 @@ def api_guilds():
 
 @app.route('/api/channels')
 def api_channels():
-    """Get channels for a specific guild"""
+    """Get channels for a guild"""
     guild_id = request.args.get('guild_id')
     
     if not guild_id:
@@ -1547,7 +2406,6 @@ def api_channels():
     if not guild:
         return jsonify({'channels': []})
     
-    # Get text channels where bot can send messages
     channels = []
     for channel in guild.channels:
         if isinstance(channel, discord.TextChannel) and channel.permissions_for(guild.me).send_messages:
@@ -1558,88 +2416,556 @@ def api_channels():
                 'position': channel.position
             })
     
-    # Sort by position
     channels.sort(key=lambda x: x['position'])
-    
     return jsonify({'channels': channels})
-
-@app.route('/api/emojis')
-def api_emojis():
-    """Get emojis for a specific guild"""
-    guild_id = request.args.get('guild_id')
-    
-    if not guild_id:
-        return jsonify({'emojis': []})
-    
-    guild = bot.get_guild(int(guild_id))
-    if not guild:
-        return jsonify({'emojis': []})
-    
-    emojis = [str(emoji) for emoji in guild.emojis]
-    return jsonify({'emojis': emojis})
 
 @app.route('/api/send', methods=['POST'])
 def api_send():
-    """Send message to channel"""
+    """Send message with file upload support"""
     try:
-        data = request.json
-        guild_id = int(data['guild_id'])
-        channel_id = int(data['channel_id'])
-        title = data.get('title', '')
-        content = data.get('content', '')
-        embed = data.get('embed', False)
+        # Check if user is logged in
+        user_id = session.get('user', {}).get('id')
+        if not user_id:
+            return jsonify({'success': False, 'error': 'Not authenticated'})
         
-        guild = bot.get_guild(guild_id)
+        # Get form data
+        guild_id = request.form.get('guild_id')
+        channel_id = request.form.get('channel_id')
+        channel_ids = request.form.get('channel_ids')
+        title = request.form.get('title', '')
+        content = request.form.get('content', '')
+        embed = request.form.get('embed', 'false') == 'true'
+        embed_color = request.form.get('embed_color', '#5865F2')
+        embed_image = request.form.get('embed_image', '')
+        embed_thumbnail = request.form.get('embed_thumbnail', '')
+        bulk_send = request.form.get('bulk_send', 'false') == 'true'
+        
+        if not guild_id:
+            return jsonify({'success': False, 'error': 'No guild specified'})
+        
+        guild = bot.get_guild(int(guild_id))
         if not guild:
             return jsonify({'success': False, 'error': 'Guild not found'})
         
-        channel = guild.get_channel(channel_id)
-        if not channel:
-            return jsonify({'success': False, 'error': 'Channel not found'})
+        # Determine target channels
+        target_channels = []
         
-        if not channel.permissions_for(guild.me).send_messages:
-            return jsonify({'success': False, 'error': 'No permission to send messages'})
+        if bulk_send and channel_ids:
+            try:
+                channel_ids_list = json.loads(channel_ids)
+                for ch_id in channel_ids_list:
+                    channel = guild.get_channel(int(ch_id))
+                    if channel and channel.permissions_for(guild.me).send_messages:
+                        target_channels.append(channel)
+            except:
+                pass
+        elif channel_id:
+            channel = guild.get_channel(int(channel_id))
+            if channel and channel.permissions_for(guild.me).send_messages:
+                target_channels.append(channel)
         
-        # Send message
-        if embed:
-            embed_obj = discord.Embed(
-                title=title if title else None,
-                description=content,
-                color=discord.Color.blue(),
-                timestamp=discord.utils.utcnow()
-            )
-            asyncio.run_coroutine_threadsafe(channel.send(embed=embed_obj), bot.loop)
-        else:
-            if title:
-                final_content = f"**{title}**\n\n{content}"
-            else:
-                final_content = content
-            asyncio.run_coroutine_threadsafe(channel.send(final_content), bot.loop)
+        if not target_channels:
+            return jsonify({'success': False, 'error': 'No valid channels specified'})
         
-        # Log the message
-        message_history.append({
-            'timestamp': time.time(),
-            'guild': guild.name,
-            'channel': channel.name,
-            'title': title,
-            'content': content[:80] + '...' if len(content) > 80 else content,
-            'type': '🎨 Embed' if embed else '📨 Message'
+        # Handle file uploads
+        files = request.files.getlist('files')
+        file_paths = []
+        
+        for file in files:
+            if file and allowed_file(file.filename):
+                filename = secure_filename(file.filename)
+                file_path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4()}_{filename}")
+                file.save(file_path)
+                file_paths.append(file_path)
+                
+                # Store in database
+                conn = sqlite3.connect('dashboard.db')
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO files (id, user_id, filename, file_type, file_size, file_data)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (str(uuid.uuid4()), user_id, filename, get_file_type(filename), 
+                      os.path.getsize(file_path), open(file_path, 'rb').read()))
+                conn.commit()
+                conn.close()
+        
+        # Send messages to all target channels
+        sent_count = 0
+        for target_channel in target_channels:
+            try:
+                # Create embed if enabled
+                if embed:
+                    embed_obj = discord.Embed(
+                        title=title if title else None,
+                        description=content,
+                        color=discord.Color.from_str(embed_color),
+                        timestamp=discord.utils.utcnow()
+                    )
+                    
+                    if embed_image:
+                        embed_obj.set_image(url=embed_image)
+                    if embed_thumbnail:
+                        embed_obj.set_thumbnail(url=embed_thumbnail)
+                    
+                    # Add files to embed
+                    files_to_send = []
+                    for file_path in file_paths:
+                        files_to_send.append(discord.File(file_path))
+                    
+                    # Send message
+                    asyncio.run_coroutine_threadsafe(
+                        target_channel.send(embed=embed_obj, files=files_to_send if files_to_send else None),
+                        bot.loop
+                    )
+                else:
+                    # Prepare regular message
+                    message_content = f"**{title}**\n\n{content}" if title else content
+                    
+                    # Add files
+                    files_to_send = []
+                    for file_path in file_paths:
+                        files_to_send.append(discord.File(file_path))
+                    
+                    # Send message
+                    asyncio.run_coroutine_threadsafe(
+                        target_channel.send(content=message_content, files=files_to_send if files_to_send else None),
+                        bot.loop
+                    )
+                
+                sent_count += 1
+                
+                # Log the message
+                message_history.append({
+                    'id': str(uuid.uuid4()),
+                    'timestamp': time.time(),
+                    'guild': guild.name,
+                    'channel': target_channel.name,
+                    'title': title,
+                    'content': content[:100] + '...' if len(content) > 100 else content,
+                    'type': '🎨 Embed' if embed else '📨 Message',
+                    'files': len(files),
+                    'status': 'sent'
+                })
+                
+                # Store in database
+                conn = sqlite3.connect('dashboard.db')
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO messages (id, user_id, guild_id, channel_id, title, content, 
+                                         embed_data, is_embed, sent_time, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (str(uuid.uuid4()), user_id, guild_id, str(target_channel.id),
+                     title, content, json.dumps({'color': embed_color}), embed, 
+                     datetime.now().isoformat(), 'sent'))
+                conn.commit()
+                
+                # Update analytics
+                today = datetime.now().date().isoformat()
+                cursor.execute('''
+                    INSERT OR IGNORE INTO analytics (date) VALUES (?)
+                ''', (today,))
+                cursor.execute('''
+                    UPDATE analytics 
+                    SET messages_sent = messages_sent + 1,
+                        files_sent = files_sent + ?,
+                        embeds_sent = embeds_sent + ?
+                    WHERE date = ?
+                ''', (len(files), 1 if embed else 0, today))
+                conn.commit()
+                conn.close()
+                
+            except Exception as e:
+                print(f"Error sending to {target_channel.name}: {e}")
+        
+        # Clean up uploaded files
+        for file_path in file_paths:
+            try:
+                os.remove(file_path)
+            except:
+                pass
+        
+        return jsonify({
+            'success': True,
+            'message': f'Message sent to {sent_count} channel(s)',
+            'sent_count': sent_count
         })
-        
-        # Keep only last 50 messages
-        if len(message_history) > 50:
-            message_history.pop(0)
-        
-        return jsonify({'success': True})
         
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
-@app.route('/api/logs')
-def api_logs():
-    """Get recent messages"""
-    # Return last 20 messages
-    return jsonify({'messages': message_history[-20:]})
+@app.route('/api/templates', methods=['GET', 'POST'])
+def api_templates():
+    """Handle templates"""
+    user_id = session.get('user', {}).get('id')
+    if not user_id:
+        return jsonify({'success': False, 'error': 'Not authenticated'})
+    
+    if request.method == 'GET':
+        # Get templates
+        conn = sqlite3.connect('dashboard.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, name, title, content, is_embed, created_at
+            FROM templates 
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+        ''', (user_id,))
+        
+        templates = []
+        for row in cursor.fetchall():
+            templates.append({
+                'id': row[0],
+                'name': row[1],
+                'title': row[2],
+                'content': row[3],
+                'embed': bool(row[4]),
+                'created_at': row[5]
+            })
+        
+        conn.close()
+        return jsonify({'success': True, 'templates': templates})
+    
+    else:
+        # Save template
+        try:
+            data = request.json
+            name = data.get('name')
+            title = data.get('title', '')
+            content = data.get('content', '')
+            embed = data.get('embed', False)
+            embed_color = data.get('embed_color', '#5865F2')
+            
+            if not name or not content:
+                return jsonify({'success': False, 'error': 'Name and content required'})
+            
+            conn = sqlite3.connect('dashboard.db')
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO templates (id, user_id, name, title, content, is_embed, embed_data)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (str(uuid.uuid4()), user_id, name, title, content, embed, 
+                 json.dumps({'color': embed_color})))
+            conn.commit()
+            conn.close()
+            
+            return jsonify({'success': True})
+            
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/schedule', methods=['POST'])
+def api_schedule():
+    """Schedule a message"""
+    user_id = session.get('user', {}).get('id')
+    if not user_id:
+        return jsonify({'success': False, 'error': 'Not authenticated'})
+    
+    try:
+        data = request.json
+        guild_id = data.get('guild_id')
+        channel_id = data.get('channel_id')
+        title = data.get('title', '')
+        content = data.get('content', '')
+        embed = data.get('embed', False)
+        embed_color = data.get('embed_color', '#5865F2')
+        scheduled_time = data.get('scheduled_time')
+        
+        if not guild_id or not channel_id or not content or not scheduled_time:
+            return jsonify({'success': False, 'error': 'Missing required fields'})
+        
+        # Parse scheduled time
+        try:
+            scheduled_dt = datetime.fromisoformat(scheduled_time.replace('Z', '+00:00'))
+        except:
+            return jsonify({'success': False, 'error': 'Invalid date format'})
+        
+        # Store in database
+        schedule_id = str(uuid.uuid4())
+        conn = sqlite3.connect('dashboard.db')
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO messages (id, user_id, guild_id, channel_id, title, content, 
+                                 embed_data, is_embed, is_scheduled, scheduled_time, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (schedule_id, user_id, guild_id, channel_id, title, content,
+             json.dumps({'color': embed_color}), embed, True, scheduled_dt.isoformat(), 'scheduled'))
+        conn.commit()
+        conn.close()
+        
+        # Schedule the message
+        def send_scheduled_message():
+            try:
+                guild = bot.get_guild(int(guild_id))
+                if guild:
+                    channel = guild.get_channel(int(channel_id))
+                    if channel and channel.permissions_for(guild.me).send_messages:
+                        if embed:
+                            embed_obj = discord.Embed(
+                                title=title if title else None,
+                                description=content,
+                                color=discord.Color.from_str(embed_color),
+                                timestamp=discord.utils.utcnow()
+                            )
+                            asyncio.run_coroutine_threadsafe(
+                                channel.send(embed=embed_obj), bot.loop
+                            )
+                        else:
+                            message_content = f"**{title}**\n\n{content}" if title else content
+                            asyncio.run_coroutine_threadsafe(
+                                channel.send(content=message_content), bot.loop
+                            )
+                        
+                        # Update database
+                        conn = sqlite3.connect('dashboard.db')
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                            UPDATE messages 
+                            SET status = 'sent', sent_time = ?
+                            WHERE id = ?
+                        ''', (datetime.now().isoformat(), schedule_id))
+                        conn.commit()
+                        conn.close()
+            except Exception as e:
+                print(f"Error sending scheduled message: {e}")
+        
+        # Calculate delay
+        delay = (scheduled_dt - datetime.now()).total_seconds()
+        if delay > 0:
+            threading.Timer(delay, send_scheduled_message).start()
+            active_schedules[schedule_id] = scheduled_dt
+        
+        return jsonify({'success': True, 'schedule_id': schedule_id})
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/scheduled')
+def api_scheduled():
+    """Get scheduled messages"""
+    user_id = session.get('user', {}).get('id')
+    if not user_id:
+        return jsonify({'scheduled': []})
+    
+    conn = sqlite3.connect('dashboard.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, guild_id, channel_id, title, content, embed_data, scheduled_time
+        FROM messages 
+        WHERE user_id = ? AND is_scheduled = 1 AND status = 'scheduled'
+        ORDER BY scheduled_time ASC
+    ''', (user_id,))
+    
+    scheduled = []
+    for row in cursor.fetchall():
+        scheduled.append({
+            'id': row[0],
+            'guild_id': row[1],
+            'channel_id': row[2],
+            'title': row[3],
+            'content': row[4],
+            'embed_data': json.loads(row[5]) if row[5] else {},
+            'scheduled_time': row[6]
+        })
+    
+    conn.close()
+    return jsonify({'scheduled': scheduled})
+
+@app.route('/api/analytics')
+def api_analytics():
+    """Get analytics data"""
+    user_id = session.get('user', {}).get('id')
+    if not user_id:
+        return jsonify({})
+    
+    conn = sqlite3.connect('dashboard.db')
+    cursor = conn.cursor()
+    
+    # Get total counts
+    cursor.execute('SELECT COUNT(*) FROM messages WHERE user_id = ?', (user_id,))
+    total_messages = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT COUNT(*) FROM files WHERE user_id = ?', (user_id,))
+    total_files = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT COUNT(*) FROM messages WHERE user_id = ? AND is_embed = 1', (user_id,))
+    total_embeds = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT COUNT(*) FROM templates WHERE user_id = ?', (user_id,))
+    total_templates = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT COUNT(*) FROM messages WHERE user_id = ? AND is_scheduled = 1 AND status = "scheduled"', (user_id,))
+    total_scheduled = cursor.fetchone()[0]
+    
+    # Get daily stats for last 7 days
+    daily_stats = {}
+    for i in range(7):
+        date = (datetime.now() - timedelta(days=i)).date().isoformat()
+        cursor.execute('''
+            SELECT messages_sent, files_sent, embeds_sent 
+            FROM analytics 
+            WHERE date = ?
+        ''', (date,))
+        
+        row = cursor.fetchone()
+        if row:
+            daily_stats[date] = {
+                'messages_sent': row[0],
+                'files_sent': row[1],
+                'embeds_sent': row[2]
+            }
+        else:
+            daily_stats[date] = {'messages_sent': 0, 'files_sent': 0, 'embeds_sent': 0}
+    
+    conn.close()
+    
+    return jsonify({
+        'total_messages': total_messages,
+        'total_files': total_files,
+        'total_embeds': total_embeds,
+        'total_templates': total_templates,
+        'total_scheduled': total_scheduled,
+        'success_rate': '100%',
+        'daily_stats': daily_stats
+    })
+
+@app.route('/api/history')
+def api_history():
+    """Get message history"""
+    user_id = session.get('user', {}).get('id')
+    if not user_id:
+        return jsonify({'history': []})
+    
+    conn = sqlite3.connect('dashboard.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, guild_id, channel_id, title, content, is_embed, sent_time, status
+        FROM messages 
+        WHERE user_id = ? AND is_scheduled = 0
+        ORDER BY sent_time DESC
+        LIMIT 50
+    ''', (user_id,))
+    
+    history = []
+    for row in cursor.fetchall():
+        history.append({
+            'id': row[0],
+            'guild': row[1],
+            'channel': row[2],
+            'title': row[3],
+            'content': row[4],
+            'type': '🎨 Embed' if row[5] else '📨 Message',
+            'timestamp': row[6],
+            'status': row[7]
+        })
+    
+    conn.close()
+    return jsonify({'history': history})
+
+@app.route('/api/activity')
+def api_activity():
+    """Get recent activity"""
+    user_id = session.get('user', {}).get('id')
+    if not user_id:
+        return jsonify({'activity': []})
+    
+    activities = []
+    
+    # Add recent messages
+    conn = sqlite3.connect('dashboard.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT title, content, sent_time 
+        FROM messages 
+        WHERE user_id = ? AND sent_time IS NOT NULL
+        ORDER BY sent_time DESC 
+        LIMIT 5
+    ''', (user_id,))
+    
+    for row in cursor.fetchall():
+        activities.append({
+            'icon': 'paper-plane',
+            'message': f"Sent: {row[0] or 'Message'}",
+            'time': row[2][:19] if row[2] else ''
+        })
+    
+    # Add file uploads
+    cursor.execute('''
+        SELECT filename, uploaded_at 
+        FROM files 
+        WHERE user_id = ?
+        ORDER BY uploaded_at DESC 
+        LIMIT 3
+    ''', (user_id,))
+    
+    for row in cursor.fetchall():
+        activities.append({
+            'icon': 'upload',
+            'message': f"Uploaded: {row[0]}",
+            'time': row[1][:19] if row[1] else ''
+        })
+    
+    conn.close()
+    return jsonify({'activity': activities})
+
+@app.route('/api/files')
+def api_files():
+    """Get uploaded files"""
+    user_id = session.get('user', {}).get('id')
+    if not user_id:
+        return jsonify({'files': []})
+    
+    conn = sqlite3.connect('dashboard.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT id, filename, file_type, file_size, uploaded_at
+        FROM files 
+        WHERE user_id = ?
+        ORDER BY uploaded_at DESC
+    ''', (user_id,))
+    
+    files = []
+    for row in cursor.fetchall():
+        files.append({
+            'id': row[0],
+            'filename': row[1],
+            'file_type': row[2],
+            'file_size': row[3],
+            'uploaded_at': row[4]
+        })
+    
+    conn.close()
+    return jsonify({'files': files})
+
+@app.route('/api/stats')
+def api_stats():
+    """Get user stats"""
+    user_id = session.get('user', {}).get('id')
+    if not user_id:
+        return jsonify({})
+    
+    conn = sqlite3.connect('dashboard.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT COUNT(*) FROM messages WHERE user_id = ?', (user_id,))
+    total_messages = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT COUNT(*) FROM files WHERE user_id = ?', (user_id,))
+    total_files = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT COUNT(*) FROM templates WHERE user_id = ?', (user_id,))
+    total_templates = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT COUNT(*) FROM messages WHERE user_id = ? AND is_scheduled = 1 AND status = "scheduled"', (user_id,))
+    total_scheduled = cursor.fetchone()[0]
+    
+    conn.close()
+    
+    return jsonify({
+        'total_messages': total_messages,
+        'total_files': total_files,
+        'total_templates': total_templates,
+        'total_scheduled': total_scheduled
+    })
 
 @app.route('/api/public_stats')
 def api_public_stats():
@@ -1650,22 +2976,6 @@ def api_public_stats():
         'servers': len(bot.guilds),
         'total_users': total_members,
         'status': 'online'
-    })
-
-@app.route('/api/stats')
-def api_stats():
-    """Detailed statistics"""
-    total_members = sum(g.member_count for g in bot.guilds)
-    total_channels = sum(len([c for c in g.channels if isinstance(c, discord.TextChannel)]) for g in bot.guilds)
-    total_emojis = sum(len(g.emojis) for g in bot.guilds)
-    
-    return jsonify({
-        'servers': len(bot.guilds),
-        'total_members': total_members,
-        'total_channels': total_channels,
-        'total_emojis': total_emojis,
-        'uptime': time.time() - bot_start_time,
-        'ping': round(bot.latency * 1000) if hasattr(bot, 'latency') else 0
     })
 
 @app.route('/health')
@@ -1688,29 +2998,24 @@ async def on_ready():
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.watching,
-            name="Message Dashboard"
+            name="Message Dashboard Pro"
         )
     )
     
-    # Store bot guilds
+    # Initialize data
     for guild in bot.guilds:
         bot_guilds.append(str(guild.id))
-        
-        # Store emojis
-        emoji_list = [str(emoji) for emoji in guild.emojis]
-        available_emojis[str(guild.id)] = emoji_list
-
-bot_start_time = time.time()
+        available_emojis[str(guild.id)] = [str(emoji) for emoji in guild.emojis]
 
 # ========== RUN APPLICATION ==========
 def run_flask():
     app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
 
 def main():
-    print("🚀 Starting Discord Message Dashboard...")
+    print("🚀 Starting Discord Dashboard Pro...")
     print(f"🔧 Client ID: {DISCORD_CLIENT_ID}")
     print(f"🔧 Redirect URI: {DISCORD_REDIRECT_URI}")
-    print("📋 Features: OAuth2 Login | Multi-Server Support | Emoji Picker | Message Logs")
+    print("📋 Features: File Upload | Scheduling | Templates | Analytics | Bulk Send")
     
     # Start Flask in background thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
