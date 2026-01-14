@@ -16,4 +16,4 @@ services:
       - key: FLASK_SECRET_KEY
         generateValue: true
     plan: free
-    healthCheckPath: /health
+    healthCheckPath: /api/health
