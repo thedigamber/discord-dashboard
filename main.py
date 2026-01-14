@@ -1,24 +1,43 @@
-# ========== FIX FOR PYTHON 3.13 ==========
+# ========== ULTIMATE FIX FOR AUDIOOP ERROR ==========
 import sys
-if sys.version_info >= (3, 13):
-    import types
-    # Create dummy audioop module
-    sys.modules['audioop'] = types.ModuleType('audioop')
-    sys.modules['_audioop'] = types.ModuleType('_audioop')
+import types
 
+# Block audioop import completely
+class AudioopBlocker:
+    def find_spec(self, fullname, path, target=None):
+        if fullname in ['audioop', '_audioop']:
+            # Return a spec with a dummy loader
+            return types.SimpleNamespace(
+                loader=None,
+                origin='dummy',
+                submodule_search_locations=[]
+            )
+        return None
+
+# Insert our blocker first
+sys.meta_path.insert(0, AudioopBlocker())
+
+# Create dummy audioop module before discord tries to import it
+audioop_module = types.ModuleType('audioop')
+audioop_module.ulaw2lin = lambda x, y: x
+audioop_module.lin2ulaw = lambda x, y: x
+audioop_module.lin2adpcm = lambda x, y, z: (x, None)
+audioop_module.adpcm2lin = lambda x, y, z: x
+sys.modules['audioop'] = audioop_module
+
+# Create dummy _audioop module
+sys.modules['_audioop'] = types.ModuleType('_audioop')
+
+# NOW import discord
 import discord
 from discord.ext import commands
-from flask import Flask, render_template_string, redirect, url_for, session, request, jsonify, send_file
+from flask import Flask, render_template_string, redirect, url_for, session, request, jsonify
 import os
 import time
 import asyncio
 import json
 import threading
 from datetime import datetime
-import io
-import base64
-from PIL import Image
-import requests
 
 # ========== CONFIGURATION ==========
 DISCORD_CLIENT_ID = os.environ.get('DISCORD_CLIENT_ID')
