@@ -1,5 +1,2 @@
-discord.py==2.3.2
+discord.py==2.2.3
 flask==2.3.3
-audioloop-lts
-Pillow==10.0.0
-requests==2.31.0
