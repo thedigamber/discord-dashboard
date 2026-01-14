@@ -16,7 +16,6 @@ import discord
 from discord.ext import commands, tasks
 import aiofiles
 import hashlib
-import base64
 
 # ============================================================================
 # COMPLETE PRODUCTION CONFIGURATION
@@ -57,11 +56,11 @@ class Config:
 config = Config()
 
 # ============================================================================
-# ADVANCED DATABASE ORM (500+ LINES)
+# ADVANCED DATABASE ORM
 # ============================================================================
 
 class Database:
-    """Production-grade database abstraction with connection pooling"""
+    """Production-grade database abstraction"""
     def __init__(self, db_path='dashboard.db'):
         self.db_path = db_path
         self.init_schema()
@@ -151,31 +150,6 @@ class Database:
             )
         ''')
         
-        # File uploads table
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS uploaded_files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                filename TEXT NOT NULL,
-                file_path TEXT NOT NULL,
-                file_size INTEGER,
-                uploaded_at INTEGER DEFAULT (unixepoch()),
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            )
-        ''')
-        
-        # User sessions table
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS sessions (
-                id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                data TEXT,
-                created_at INTEGER DEFAULT (unixepoch()),
-                expires_at INTEGER,
-                FOREIGN KEY(user_id) REFERENCES users(id)
-            )
-        ''')
-        
         conn.commit()
         conn.close()
         print("✅ Database schema initialized")
@@ -200,10 +174,6 @@ class Database:
         # Welcome config indexes
         c.execute('CREATE INDEX IF NOT EXISTS idx_welcome_guild ON welcome_config(guild_id)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_welcome_enabled ON welcome_config(enabled)')
-        
-        # File indexes
-        c.execute('CREATE INDEX IF NOT EXISTS idx_files_user ON uploaded_files(user_id)')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_files_uploaded ON uploaded_files(uploaded_at)')
         
         conn.commit()
         conn.close()
@@ -391,14 +361,8 @@ class DiscordOAuth:
     
     @staticmethod
     def get_user_data(access_token):
-        headers = {'Authorization': f'Bearer {access_token}"}
+        headers = {'Authorization': f'Bearer {access_token}'}
         response = requests.get(f"{DiscordOAuth.API_BASE}/users/@me", headers=headers)
-        return response.json()
-    
-    @staticmethod
-    def get_user_guilds(access_token):
-        headers = {'Authorization': f"Bearer {access_token}"}
-        response = requests.get(f"{DiscordOAuth.API_BASE}/users/@me/guilds", headers=headers)
         return response.json()
 
 # ============================================================================
@@ -796,8 +760,7 @@ def health():
     return jsonify({
         'status': 'healthy',
         'bot_ready': bot_manager.ready,
-        'timestamp': int(time.time()),
-        'uptime': time.time() - time.time()  # Will be tracked properly in production
+        'timestamp': int(time.time())
     }), 200
 
 @app.route('/api/guilds')
@@ -941,7 +904,7 @@ def api_templates():
 
 @app.route('/api/files', methods=['POST'])
 @require_auth
-async def api_files():
+async def api_upload():
     """File upload with validation"""
     if 'files' not in request.files:
         return jsonify({'error': 'No files provided'}), 400
@@ -1053,7 +1016,7 @@ def serve_upload(filename):
     return send_from_directory(UPLOAD_DIR, filename)
 
 # ============================================================================
-# COMPLETE HTML TEMPLATE (3,500+ LINES)
+# COMPLETE HTML TEMPLATE
 # ============================================================================
 
 DASHBOARD_HTML = '''
@@ -1520,7 +1483,6 @@ DASHBOARD_HTML = '''
                 height: 300px;
                 position: absolute;
                 z-index: 50;
-                transform: translateY(0);
             }
             
             .sidebar.collapsed {
@@ -2263,7 +2225,6 @@ DASHBOARD_HTML = '''
             showToast('Resending...', 'info');
             
             try {
-                // Get message details from history
                 const response = await fetch(`/api/resend/${msgId}`, {
                     method: 'POST'
                 });
