@@ -43,7 +43,7 @@ from datetime import datetime
 DISCORD_CLIENT_ID = os.environ.get('DISCORD_CLIENT_ID')
 DISCORD_CLIENT_SECRET = os.environ.get('DISCORD_CLIENT_SECRET')
 DISCORD_BOT_TOKEN = os.environ.get('DISCORD_BOT_TOKEN')
-DISCORD_REDIRECT_URI = os.environ.get('DISCORD_REDIRECT_URI', 'https://dashboard.digamber.in/api/auth/callback/discord')
+DISCORD_REDIRECT_URI = os.environ.get('DISCORD_REDIRECT_URI', 'https://dashboard.digamber.in/callback')
 FLASK_SECRET_KEY = os.environ.get('FLASK_SECRET_KEY', 'your-secret-key-here')
 
 # ========== FLASK APP ==========
@@ -953,7 +953,7 @@ HTML_TEMPLATE = '''
                 </a>
             </div>
             <p style="color: var(--light); margin-top: 20px;">
-                🤖 Discord Message Dashboard v2.0 | Powered by Digamber Fuckner 👺
+                🤖 Discord Message Dashboard v2.0 | Powered by Discord.py & Flask
             </p>
             <p class="update-time" style="color: var(--light); font-size: 0.9rem; margin-top: 10px;">
                 Last Updated: <span id="currentTime">{{ current_time }}</span>
@@ -1440,14 +1440,14 @@ def index():
 def login():
     params = {
         'client_id': DISCORD_CLIENT_ID,
-        'redirect_uri': DISCORD_REDIRECT_URI,  # ये important है
+        'redirect_uri': DISCORD_REDIRECT_URI,
         'response_type': 'code',
         'scope': 'identify guilds'
     }
     url = f"https://discord.com/api/oauth2/authorize?{'&'.join([f'{k}={v}' for k, v in params.items()])}"
     return redirect(url)
 
-@app.route('/api/auth/callback/discord')
+@app.route('/callback')
 def callback():
     code = request.args.get('code')
     if not code:
@@ -1465,39 +1465,39 @@ def callback():
     
     headers = {'Content-Type': 'application/x-www-form-urlencoded'}
     
-    import requests
-    r = requests.post('https://discord.com/api/oauth2/token', data=data, headers=headers)
-    if r.status_code != 200:
-        return f"Token exchange failed: {r.text}", 400
-    
-    token_data = r.json()
-    access_token = token_data['access_token']
+    try:
+        r = requests.post('https://discord.com/api/oauth2/token', data=data, headers=headers)
+        if r.status_code != 200:
+            return f"Token exchange failed: {r.text}", 400
+        
+        token_data = r.json()
+        access_token = token_data['access_token']
         
         # Get user info
-    headers = {'Authorization': f'Bearer {access_token}'}
-    r = requests.get('https://discord.com/api/users/@me', headers=headers)
-    if r.status_code != 200:
-        return "Failed to get user info", 400
-    
-    user = r.json()
+        headers = {'Authorization': f'Bearer {access_token}'}
+        r = requests.get('https://discord.com/api/users/@me', headers=headers)
+        if r.status_code != 200:
+            return "Failed to get user info", 400
+        
+        user = r.json()
         
         # Get user guilds
-    r = requests.get('https://discord.com/api/users/@me/guilds', headers=headers)
-    user_guilds = r.json() if r.status_code == 200 else []
+        r = requests.get('https://discord.com/api/users/@me/guilds', headers=headers)
+        user_guilds = r.json() if r.status_code == 200 else []
         
         # Store in session
-    session['user'] = user
-    session['access_token'] = access_token
-    session['user_guilds'] = [str(g['id']) for g in user_guilds]
+        session['user'] = user
+        session['access_token'] = access_token
+        session['user_guilds'] = [str(g['id']) for g in user_guilds]
         
         # Store in bot data
-    user_sessions[str(user['id'])] = {
-        'user': user,
-        'access_token': access_token,
-        'guilds': [str(g['id']) for g in user_guilds]
-    }
-    
-    return redirect('/')
+        user_sessions[str(user['id'])] = {
+            'user': user,
+            'access_token': access_token,
+            'guilds': [str(g['id']) for g in user_guilds]
+        }
+        
+        return redirect('/')
         
     except Exception as e:
         return f"Error: {str(e)}", 500
