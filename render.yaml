@@ -2,9 +2,7 @@ services:
   - type: web
     name: discord-message-dashboard
     env: python
-    buildCommand: |
-  python -m pip install --upgrade pip
-  python -m pip install discord.py==2.3.2 flask==2.3.3
+    buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
       - key: DISCORD_CLIENT_ID
