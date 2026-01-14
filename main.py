@@ -28,7 +28,7 @@ sys.modules['audioop'] = audioop_module
 # Create dummy _audioop module
 sys.modules['_audioop'] = types.ModuleType('_audioop')
 
-# NOW import discord
+# NOW import everything else
 import discord
 from discord.ext import commands
 from flask import Flask, render_template_string, redirect, url_for, session, request, jsonify
@@ -38,6 +38,7 @@ import asyncio
 import json
 import threading
 from datetime import datetime
+import requests
 
 # ========== CONFIGURATION ==========
 DISCORD_CLIENT_ID = os.environ.get('DISCORD_CLIENT_ID')
