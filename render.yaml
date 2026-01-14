@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: discord-message-dashboard
+    name: discord-dashboard
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
@@ -13,7 +13,6 @@ services:
         sync: false
       - key: DISCORD_REDIRECT_URI
         value: https://dashboard.digamber.in/callback
-        sync: false
       - key: FLASK_SECRET_KEY
         generateValue: true
     plan: free
